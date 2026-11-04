@@ -3,6 +3,25 @@
 MCP server read-only untuk Unity Catalog, MLflow, dan Jobs Databricks, lewat Streamable HTTP di `/mcp`.
 Spesifikasi lengkap ada di `docs/2026-10-30-mody-mcp-generik-design.md`.
 
+## Struktur
+
+| File | Isi |
+|---|---|
+| `server.py` | Entrypoint: auth bearer, cek config saat start, jalankan uvicorn |
+| `mody_mcp/core.py` | Instance MCP + audit log, client Databricks, guard catalog, format tabel |
+| `mody_mcp/uc.py` | Tool metadata Unity Catalog |
+| `mody_mcp/sql.py` | Tool query lewat SQL warehouse |
+| `mody_mcp/mlflow.py` | Tool MLflow |
+| `mody_mcp/jobs.py` | Tool Databricks Jobs |
+| `mody_mcp/github.py` | Tool GitHub + guard branch/path |
+| `tests/` | Satu file test per modul, fixture bersama di `conftest.py` |
+
+Tool baru: tulis di modul yang sesuai dengan `@mcp.tool()`. Modul baru perlu di-import di `server.py`.
+
+## Tool
+
+### Databricks (`uc.py`, `sql.py`, `mlflow.py`, `jobs.py`)
+
 | Tool | Isi | Warehouse |
 |---|---|---|
 | `list_catalogs()` | Daftar catalog | tidak |
@@ -20,7 +39,7 @@ Spesifikasi lengkap ada di `docs/2026-10-30-mody-mcp-generik-design.md`.
 
 Tool MLflow dibatasi `ALLOWED_EXPERIMENT_PREFIX`, tool job dibatasi `ALLOWED_JOB_PREFIX`.
 
-### GitHub (satu repo, `GITHUB_REPO`)
+### GitHub (`github.py`, satu repo `GITHUB_REPO`)
 
 | Tool | Isi |
 |---|---|
