@@ -1,0 +1,8 @@
+.venv
+.git
+.env
+mcp.log
+docs
+__pycache__
+.pytest_cache
+test_server.py
