@@ -330,6 +330,15 @@ def test_job_runs_by_name_includes_latest_detail_and_errors(jobs_fake):
 def test_job_runs_by_run_id(jobs_fake):
     out = server.job_runs(run_id=100)
     assert out.startswith("## mody_train_dev run 100") and "### task run 11 (FAILED)" in out
+    assert "https://x/run/100" not in out and "- url" not in out
+
+
+def test_job_run_message_redacts_host(jobs_fake):
+    run = jobs_fake.jobs.get_run(100, include_history=True)
+    run.state = NS(**{**vars(run.state), "state_message": "gagal di https://dbc-1.cloud.databricks.com/x workspace_id=123"})
+    jobs_fake.jobs.get_run = lambda run_id, include_history: run
+    out = server.job_runs(run_id=100)
+    assert "databricks.com" not in out and "workspace_id" not in out and "gagal di" in out
 
 
 def test_job_runs_without_args_lists_jobs(jobs_fake):

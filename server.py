@@ -903,8 +903,7 @@ def get_job_run(run_id: int) -> str:
         f"- state: {cell(run_state(run.state))}, start: {cell(ts(run.start_time))}, "
         f"durasi: {cell(duration(run.start_time, run.end_time))}\n"
         f"- repair: {repair_note}\n"
-        f"- message: {cell(run.state.state_message if run.state else None)}\n"
-        f"- url: {cell(run.run_page_url)}\n\n"
+        f"- message: {cell(scrub(run.state.state_message or '') if run.state else None)}\n\n"
         f"### params\n{md_table(['name', 'value'], sorted(job_params(run).items()))}\n\n"
         f"### tasks ({len(tasks)})\n"
         + md_table(
