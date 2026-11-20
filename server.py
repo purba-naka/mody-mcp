@@ -788,6 +788,18 @@ def plain(text: str | None) -> str:
     return MARKUP.sub("", text or "").strip()
 
 
+CONFIG_LEAK = re.compile(r"\s*Config:[^\n]*")
+
+
+def scrub(text: str) -> str:
+    """Seperti redact, tapi per baris dan tanpa batas panjang: untuk error dan trace task."""
+    text = CONFIG_LEAK.sub("", text)
+    for pattern, repl in REDACTIONS:
+        if "Config" not in pattern.pattern:  # versi re.S membuang seluruh trace sesudahnya
+            text = pattern.sub(repl, text)
+    return text.strip()
+
+
 def job_prefix() -> str:
     return os.environ.get("ALLOWED_JOB_PREFIX", "mody_")
 
@@ -883,7 +895,8 @@ def get_job_run(run_id: int) -> str:
         + ", ".join(cell(run_state(h.state)) for h in (run.repair_history or [])[:-1])
         if repairs else "-"
     )
-    failed = [t for t in tasks if run_state(t.state) in FAILED_STATES][-MAX_FAILED_TASKS:]
+    final = {t.task_key: t for t in tasks}  # attempt terakhir per task; attempt lama yang sudah di-repair diabaikan
+    failed = [t for t in final.values() if run_state(t.state) in FAILED_STATES][-MAX_FAILED_TASKS:]
     errors = "".join(f"\n\n{get_task_output(t.run_id, checked=True, tail=TASK_TRACE_TAIL)}" for t in failed)
     return (
         f"## {name} run {run.run_id}\n"
@@ -908,8 +921,8 @@ def get_task_output(task_run_id: int, checked: bool = False, tail: int = TRACE_T
     out = ws().jobs.get_run_output(task_run_id)
     if not checked:
         check_job_id(out.metadata.job_id if out.metadata else None)
-    error = plain(out.error) or "(tidak ada error)"
-    trace = plain(out.error_trace)
+    error = scrub(plain(out.error)) or "(tidak ada error)"
+    trace = scrub(plain(out.error_trace))
     if len(trace) > tail:
         trace = "...\n" + trace[-tail:]
     state = run_state(out.metadata.state if out.metadata else None)
@@ -1177,6 +1190,10 @@ def github_ci_log(job_id: int, checked: bool = False, tail: int = TRACE_TAIL, na
         if not checked or e.status not in (404, 410):
             raise
         return f"{title}\n(log tidak tersedia, mungkin check bukan GitHub Actions atau sudah kedaluwarsa)"
+    marker = log.rfind("##[error]")
+    if marker >= 0:  # langkah cleanup sesudah error tidak berguna, potong di baris error terakhir
+        end = log.find("\n", marker)
+        log = log[: end if end >= 0 else len(log)]
     if len(log) > tail:
         log = "...\n" + log[-tail:]
     return f"{title}\n```\n{log or '(kosong)'}\n```"

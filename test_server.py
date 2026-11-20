@@ -337,6 +337,35 @@ def test_job_runs_without_args_lists_jobs(jobs_fake):
     assert "mody_train_dev" in server.job_runs()
 
 
+def test_job_run_ignores_failed_attempts_fixed_by_repair(jobs_fake):
+    run = jobs_fake.jobs.get_run(100, include_history=True)
+    retry = NS(**{**vars(run.tasks[0]), "run_id": 12, "attempt_number": 1, "state": job_state("SUCCESS"),
+                  "start_time": T0 + 100_000})
+    run.tasks = [run.tasks[0], retry]
+    jobs_fake.jobs.get_run = lambda run_id, include_history: run
+    assert "### task run" not in server.job_runs(run_id=100)
+
+
+def test_task_error_redacts_host(jobs_fake):
+    jobs_fake.jobs.get_run_output = lambda run_id: NS(
+        error="PermissionDenied: x. Config: host=https://jakarta.cloud.databricks.com, auth_type=pat",
+        error_trace="line1\nraise err https://dbc-1.cloud.databricks.com/api\nPermissionDenied: x. Config: host=h\nend",
+        metadata=NS(job_id=1, state=job_state("FAILED")))
+    out = server.get_task_output(11)
+    assert "databricks.com" not in out and "Config" not in out and "end" in out and "line1" in out
+
+
+def test_ci_log_cut_at_last_error(github, monkeypatch):
+    log = "setup\nrun tests\n##[error]Process completed with exit code 1.\nPost job cleanup\nCleaning up orphan processes\n"
+    original = github.handle
+    route = lambda r: httpx.Response(200, text=log) if r.url.path.endswith("/logs") else original(r)  # noqa: E731
+    client = httpx.Client(base_url=server.GITHUB_API, transport=httpx.MockTransport(route),
+                          headers={"Authorization": "Bearer tok"})
+    monkeypatch.setattr(server, "gh", lambda: client)
+    out = server.github_ci_log(99)
+    assert "exit code 1" in out and "cleanup" not in out
+
+
 def test_job_run_skips_output_for_successful_tasks(jobs_fake):
     jobs_fake.jobs.get_run_output = lambda run_id: pytest.fail("tidak boleh dipanggil")
     run = jobs_fake.jobs.get_run(100, include_history=True)
