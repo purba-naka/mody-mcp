@@ -138,7 +138,7 @@ def test_bearer_auth():
         assert ok.status_code == 200
         names = {t["name"] for t in ok.json()["result"]["tools"]}
         assert names == {
-            "list_tables", "describe_table", "query_table", "aggregate_table", "list_models", "search_runs", "job_runs",
+            "list_tables", "describe_table", "query_table", "aggregate_table", "list_models", "search_runs", "run_artifacts", "job_runs",
             "github_read", "github_commit_files", "github_update_pr", "github_pr_status",
         }
 
@@ -1077,3 +1077,29 @@ def test_aggregate_table_join_rejects_other_catalog(fake):
 def test_metric_at_bounds():
     with pytest.raises(Exception):  # noqa: B017
         server.Metric(fn="avg", column="x", at=999)
+
+
+def test_run_artifacts_list(mlflow_fake):
+    mlflow_fake.api_client = NS(do=lambda method, path, query: {"files": [
+        {"path": "confusion_matrix.json", "is_dir": False, "file_size": 120}, {"path": "plots", "is_dir": True}]})
+    out = server.run_artifacts("r1")
+    assert "2 item di '/'" in out and "| confusion_matrix.json | file | 120 |" in out and "| plots | folder | - |" in out
+
+
+def test_run_artifacts_reads_text(mlflow_fake, monkeypatch):
+    monkeypatch.setattr(server, "read_artifact", lambda rid, path: f"{rid}|{path}|[[5,1],[2,7]]")
+    mlflow_fake.experiments.get_run = lambda run_id: NS(run=NS(
+        info=NS(experiment_id="1", artifact_uri="dbfs:/a/r1"), data=NS(metrics=[], params=[], tags=[])))
+    out = server.run_artifacts("r1", "confusion_matrix.json")
+    assert "r1|confusion_matrix.json|[[5,1],[2,7]]" in out
+
+
+@pytest.mark.parametrize("path", ["../x.json", "/abs.json"])
+def test_run_artifacts_rejects_bad_path(mlflow_fake, path):
+    with pytest.raises(ValueError, match="relatif"):
+        server.run_artifacts("r1", path)
+
+
+def test_run_artifacts_rejects_other_experiment(mlflow_fake):
+    with pytest.raises(ValueError, match="tidak diizinkan"):
+        server.run_artifacts("foreign")

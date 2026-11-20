@@ -731,6 +731,51 @@ def get_run(run_id: str) -> str:
     )
 
 
+MAX_ARTIFACT_CHARS = 4000
+TEXT_ARTIFACT = re.compile(r"\.(json|csv|txt|md|yml|yaml|log|tsv)$", re.I)
+
+
+def allowed_run(run_id: str) -> Any:
+    run = ws().experiments.get_run(run_id).run
+    check_experiment(ws().experiments.get_experiment(run.info.experiment_id).experiment.name)
+    return run
+
+
+def read_artifact(run_id: str, path: str) -> str:
+    """Baca artifact lewat URL bertanda tangan dari Databricks (DBFS root biasanya diblokir untuk token)."""
+    resp = ws().api_client.do("POST", "/api/2.0/mlflow/artifacts/credentials-for-read",
+                              body={"run_id": run_id, "path": [path]})
+    infos = resp.get("credential_infos") or []
+    if not infos:
+        raise ValueError(f"Artifact '{path}' tidak ditemukan. Lihat daftar dengan run_artifacts(run_id)")
+    info = infos[0]
+    with httpx.stream("GET", info["signed_uri"], timeout=30,
+                      headers={h["name"]: h["value"] for h in info.get("headers") or []}) as r:
+        if r.status_code == 404:
+            raise ValueError(f"Artifact '{path}' tidak ditemukan. Lihat daftar dengan run_artifacts(run_id)")
+        r.raise_for_status()
+        data = next(r.iter_bytes(MAX_ARTIFACT_CHARS * 4 + 1), b"")
+    text = data.decode("utf-8", errors="replace")
+    return text[:MAX_ARTIFACT_CHARS] + ("\n... (dipotong)" if len(text) > MAX_ARTIFACT_CHARS else "")
+
+
+@mcp.tool()
+def run_artifacts(run_id: str, path: str = "") -> str:
+    """Artifact satu run MLflow, mis. confusion matrix, laporan evaluasi, plot.
+
+    path kosong atau folder = daftar file (nama dan ukuran). path file teks (json/csv/txt/md/yml/log)
+    = isinya, dipotong. File biner (png, model) hanya ditampilkan namanya.
+    """
+    if ".." in path.split("/") or path.startswith("/"):
+        raise ValueError("path artifact harus relatif tanpa '..'")
+    allowed_run(run_id)
+    if path and TEXT_ARTIFACT.search(path):
+        return f"## {path} (run {run_id})\n" + read_artifact(run_id, path)
+    resp = ws().api_client.do("GET", "/api/2.0/mlflow/artifacts/list", query={"run_id": run_id, "path": path})
+    rows = [[f.get("path"), "folder" if f.get("is_dir") else "file", f.get("file_size")] for f in resp.get("files") or []]
+    return f"{len(rows)} item di '{path or '/'}' (run {run_id})\n" + md_table(["path", "tipe", "ukuran"], rows)
+
+
 MAX_VERSIONS_WITH_METRICS = 10
 
 
