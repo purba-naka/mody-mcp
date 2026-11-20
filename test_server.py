@@ -870,7 +870,7 @@ def test_tool_schema_budget():
     import asyncio
     tools = asyncio.run(server.mcp.list_tools())
     total = sum(len(json.dumps({"n": t.name, "d": t.description, "p": t.inputSchema})) for t in tools)
-    assert total < 11700, total
+    assert total < 12000, total
 
 
 def test_schema_titles_stripped_but_title_parameter_kept():
@@ -926,3 +926,88 @@ def test_search_runs_without_path_and_no_experiments(mlflow_fake):
     mlflow_fake.experiments.search_experiments = lambda **kw: []
     with pytest.raises(ValueError, match="Tidak ada experiment"):
         server.search_runs()
+
+
+# ---------- join + kolom array ----------
+
+OTHER = "mody_dev.geo_commodity_classification.ft_point_band"
+OTHER_COLS = {"scope", "period", "ndvi", "b12"}
+
+
+def join_agg(**kw):
+    kw.setdefault("metrics", [server.Metric(fn="avg", column="b.ndvi", array="mean")])
+    kw.setdefault("join", server.Join(table="ft_point_band", on=["scope", "period"]))
+    return server.build_aggregate(TBL, COLS, join_name=OTHER, join_columns=OTHER_COLS, **kw)
+
+
+def test_join_sql_uses_only_parameter_markers():
+    sql, params = join_agg(group_by=["truth_class", "pred_class"],
+                           filters=[Filter(column="truth_class", op="=", value="padi'; DROP")])
+    assert sql == (
+        "SELECT IDENTIFIER(:g0), IDENTIFIER(:g1), "
+        "AVG((aggregate(IDENTIFIER(:m0), CAST(0 AS DOUBLE), (acc, v) -> acc + v) / nullif(size(IDENTIFIER(:m0)), 0))) "
+        "AS `avg_b_ndvi_mean` FROM IDENTIFIER(:tbl) AS a JOIN IDENTIFIER(:tbl2) AS b "
+        "ON IDENTIFIER(:ja0) = IDENTIFIER(:jb0) AND IDENTIFIER(:ja1) = IDENTIFIER(:jb1) "
+        "WHERE IDENTIFIER(:f0) = :v0 GROUP BY 1, 2 ORDER BY `avg_b_ndvi_mean` DESC LIMIT 50"
+    )
+    assert "DROP" not in sql
+    assert params["tbl2"] == OTHER and params["m0"] == "b.`ndvi`" and params["g0"] == "a.`truth_class`"
+    assert params["ja0"] == "a.`scope`" and params["jb1"] == "b.`period`" and params["f0"] == "a.`truth_class`"
+
+
+def test_array_element_and_reducers():
+    sql, _ = join_agg(metrics=[server.Metric(fn="avg", column="b.b12", at=4), server.Metric(fn="max", column="b.ndvi", array="max")])
+    assert "AVG(try_element_at(IDENTIFIER(:m0), 5)) AS `avg_b_b12_at4`" in sql
+    assert "MAX(array_max(IDENTIFIER(:m1))) AS `max_b_ndvi_max`" in sql
+
+
+def test_unqualified_column_means_first_table_and_b_prefix_second():
+    _, params = join_agg(group_by=["scope", "b.period"], metrics=[server.Metric(fn="count")])
+    assert params["g0"] == "a.`scope`" and params["g1"] == "b.`period`"
+
+
+@pytest.mark.parametrize("kwargs, msg", [
+    ({"metrics": [server.Metric(fn="avg", column="b.nope")]}, "tidak ada"),
+    ({"metrics": [server.Metric(fn="avg", column="ndvi")]}, "tidak ada"),  # ndvi hanya di tabel kedua
+    ({"join": server.Join(table="t", on=[])}, "join.on"),
+    ({"join": server.Join(table="t", on=["pred_class"])}, "kedua tabel"),
+    ({"metrics": [server.Metric(fn="avg", column="b.ndvi", array="mean", at=1)]}, "salah satu"),
+])
+def test_join_rejects_bad_input(kwargs, msg):
+    with pytest.raises(ValueError, match=msg):
+        join_agg(**kwargs)
+
+
+def test_no_join_sql_unchanged_and_b_prefix_rejected():
+    sql, params = server.build_aggregate(TBL, COLS, metrics=[server.Metric(fn="count")], group_by=["scope"])
+    assert " AS a" not in sql and params["g0"] == "`scope`"
+    with pytest.raises(ValueError, match="tidak ada"):
+        server.build_aggregate(TBL, COLS, metrics=[server.Metric(fn="avg", column="b.scope")])
+
+
+def test_resolve_join_table_stays_in_allowed_catalog():
+    assert server.resolve_join_table(TBL, "ft_point_band") == OTHER
+    assert server.resolve_join_table(TBL, "mody_dev.core.x") == "mody_dev.core.x"
+    with pytest.raises(ValueError, match="tidak diizinkan"):
+        server.resolve_join_table(TBL, "main.secret.t")
+    with pytest.raises(ValueError):
+        server.resolve_join_table(TBL, "a.b")
+
+
+def test_aggregate_table_with_join_runs(fake):
+    out = server.aggregate_table(
+        TBL, metrics=[server.Metric(fn="count")], group_by=["scope"],
+        join=server.Join(table="ft_point_band", on=["scope"]))
+    assert "JOIN IDENTIFIER(:tbl2) AS b" in fake.sent["statement"]
+    assert {p.name: p.value for p in fake.sent["parameters"]}["tbl2"] == OTHER
+    assert out.startswith("2 baris")
+
+
+def test_aggregate_table_join_rejects_other_catalog(fake):
+    with pytest.raises(ValueError, match="tidak diizinkan"):
+        server.aggregate_table(TBL, metrics=[server.Metric(fn="count")], join=server.Join(table="main.s.t", on=["scope"]))
+
+
+def test_metric_at_bounds():
+    with pytest.raises(Exception):  # noqa: B017
+        server.Metric(fn="avg", column="x", at=999)

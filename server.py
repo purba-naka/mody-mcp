@@ -423,20 +423,28 @@ def table_columns(full_name: str, refresh: bool = False) -> set[str]:
     return columns
 
 
-def with_columns(full_name: str, build: Any) -> str:
-    """Jalankan query dengan validasi kolom. Kalau kolom tidak dikenal dan daftar berasal dari cache, ambil ulang sekali."""
+def with_columns(full_name: str, build: Any, other: str | None = None) -> str:
+    """Jalankan query dengan validasi kolom. Kalau kolom tidak dikenal dan daftar berasal dari cache, ambil ulang sekali.
+
+    build(kolom_utama, kolom_tabel_kedua_atau_None) -> (sql, params).
+    """
     split_full_name(full_name)
-    cached = full_name in COLUMN_CACHE
+    cached = full_name in COLUMN_CACHE or (other is not None and other in COLUMN_CACHE)
+
+    def go(refresh: bool) -> str:
+        known = table_columns(full_name, refresh)
+        return run_query(*build(known, table_columns(other, refresh) if other else None))
+
     try:
-        return run_query(*build(table_columns(full_name)))
+        return go(False)
     except ValueError as e:
         if cached and "tidak ada" in str(e):
-            return run_query(*build(table_columns(full_name, refresh=True)))
+            return go(True)
         raise
 
 
 def query(full_name: str, **kwargs: Any) -> str:
-    return with_columns(full_name, lambda known: build_query(full_name, known, **kwargs))
+    return with_columns(full_name, lambda known, _: build_query(full_name, known, **kwargs))
 
 
 @mcp.tool()
@@ -474,7 +482,36 @@ AGG_FUNCS = {"count": "COUNT", "count_distinct": "COUNT", "avg": "AVG", "min": "
 
 class Metric(BaseModel):
     fn: Literal["count", "count_distinct", "avg", "min", "max", "sum", "stddev", "median"]
-    column: str = Field(default="", description="Kolom yang diagregasi. Kosong hanya untuk count")
+    column: str = Field(default="", description="Kolom. Kosong hanya untuk count. Dengan join, kolom tabel kedua diawali b.")
+    array: Literal["", "mean", "max", "min"] = Field(default="", description="Kolom array: ringkas tiap baris dulu")
+    at: int = Field(default=-1, ge=-1, le=255, description="Kolom array: ambil elemen ke-n (mulai 0). -1 = tidak dipakai")
+
+
+class Join(BaseModel):
+    table: str = Field(description="Tabel kedua: nama tabel di schema yang sama, atau catalog.schema.table")
+    on: list[str] = Field(description="Kolom penghubung yang ada di kedua tabel, mis. [\"entity_id\", \"period\"]")
+
+
+MAX_JOIN_KEYS = 3
+
+
+def resolve_join_table(full_name: str, table: str) -> str:
+    """Nama pendek -> schema yang sama dengan tabel utama. Catalog tetap diperiksa allowlist."""
+    other = f"{full_name.rsplit('.', 1)[0]}.{table}" if "." not in table else table
+    split_full_name(other)
+    return other
+
+
+def array_expr(col: str, m: Metric) -> str:
+    if m.at >= 0 and m.array:
+        raise ValueError("Pilih salah satu: array atau at")
+    if m.at >= 0:
+        return f"try_element_at({col}, {int(m.at) + 1})"
+    if m.array == "mean":
+        return f"(aggregate({col}, CAST(0 AS DOUBLE), (acc, v) -> acc + v) / nullif(size({col}), 0))"
+    if m.array in ("max", "min"):
+        return f"array_{m.array}({col})"
+    return col
 
 
 def build_aggregate(
@@ -486,18 +523,40 @@ def build_aggregate(
     order_by: str | None = None,
     desc: bool = True,
     limit: int = 50,
+    join: Join | None = None,
+    join_name: str | None = None,
+    join_columns: set[str] | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Susun SELECT agregat bertemplate. Sama seperti build_query: nama dan nilai jadi parameter marker."""
     params: dict[str, str] = {"tbl": full_name}
     group_by = group_by or []
     if not metrics or len(metrics) > MAX_METRICS or len(group_by) > MAX_GROUP_BY:
         raise ValueError(f"metrics wajib 1 sampai {MAX_METRICS}, group_by maksimal {MAX_GROUP_BY}")
+    joined = join is not None
 
     def ident(name: str, key: str) -> str:
-        if name not in known_columns:
-            raise ValueError(f"Kolom '{name}' tidak ada. Kolom yang sah: {sorted(known_columns)}")
-        params[key] = f"`{name}`"
+        side, col = "a", name
+        if joined and name[:2] in ("a.", "b."):
+            side, col = name[0], name[2:]
+        valid = join_columns if side == "b" and joined else known_columns
+        if col not in valid:
+            hint = " Dengan join, kolom tabel kedua diawali b." if joined else ""
+            raise ValueError(f"Kolom '{name}' tidak ada. Kolom yang sah: {sorted(valid or [])}.{hint}")
+        params[key] = f"{side}.`{col}`" if joined else f"`{col}`"
         return f"IDENTIFIER(:{key})"
+
+    source = "FROM IDENTIFIER(:tbl)"
+    if joined:
+        if not join.on or len(join.on) > MAX_JOIN_KEYS:
+            raise ValueError(f"join.on wajib 1 sampai {MAX_JOIN_KEYS} kolom")
+        for col in join.on:
+            if col not in known_columns or col not in (join_columns or set()):
+                raise ValueError(f"Kolom join '{col}' harus ada di kedua tabel")
+        params["tbl2"] = join_name or ""
+        for i, col in enumerate(join.on):
+            params[f"ja{i}"], params[f"jb{i}"] = f"a.`{col}`", f"b.`{col}`"
+        cond = " AND ".join(f"IDENTIFIER(:ja{i}) = IDENTIFIER(:jb{i})" for i in range(len(join.on)))
+        source = f"FROM IDENTIFIER(:tbl) AS a JOIN IDENTIFIER(:tbl2) AS b ON {cond}"
 
     select = [ident(c, f"g{i}") for i, c in enumerate(group_by)]
     aliases: list[str] = []
@@ -507,15 +566,16 @@ def build_aggregate(
                 raise ValueError(f"fn '{m.fn}' butuh column")
             expr, alias = "COUNT(*)", "n"
         else:
-            col = ident(m.column, f"m{i}")
+            col = array_expr(ident(m.column, f"m{i}"), m)
             expr = f"COUNT(DISTINCT {col})" if m.fn == "count_distinct" else f"{AGG_FUNCS[m.fn]}({col})"
-            alias = f"{m.fn}_{re.sub(r'[^A-Za-z0-9_]', '_', m.column)}"
+            suffix = f"_at{m.at}" if m.at >= 0 else (f"_{m.array}" if m.array else "")
+            alias = f"{m.fn}_{re.sub(r'[^A-Za-z0-9_]', '_', m.column)}{suffix}"
         if alias in aliases:
             raise ValueError(f"Metrik '{alias}' dobel")
         aliases.append(alias)
         select.append(f"{expr} AS `{alias}`")
 
-    sql = f"SELECT {', '.join(select)} FROM IDENTIFIER(:tbl)" + where_clause(filters, ident, params)
+    sql = f"SELECT {', '.join(select)} {source}" + where_clause(filters, ident, params)
     if group_by:
         sql += " GROUP BY " + ", ".join(str(i + 1) for i in range(len(group_by)))
         target = order_by or aliases[0]
@@ -539,15 +599,23 @@ def aggregate_table(
     order_by: str = "",
     desc: bool = True,
     limit: int = 50,
+    join: Join | None = None,
 ) -> str:
-    """Agregat satu tabel, opsional per kelompok (read-only). Pakai ini, bukan query_table, untuk statistik,
-    distribusi, perbandingan antar kelas, dan confusion matrix.
+    """Agregat satu tabel, opsional digabung tabel kedua (read-only). Pakai ini, bukan query_table, untuk statistik,
+    distribusi, perbandingan antar kelas, confusion matrix, dan profil fitur per kelas.
 
-    metrics: [{"fn": "count"}, {"fn": "avg", "column": "ndvi"}] -> kolom n, avg_ndvi. fn: count, count_distinct, avg, min, max, sum, stddev, median.
-    group_by: mis. ["truth_class", "pred_class"]. filters: seperti query_table. order_by: nama hasil atau kolom group_by.
+    metrics: [{"fn": "count"}, {"fn": "avg", "column": "pred_score"}] -> n, avg_pred_score. fn: count, count_distinct, avg, min, max, sum, stddev, median.
+    group_by: mis. ["truth_class", "pred_class"]; group_by entity_id = satu baris per entity. filters: seperti query_table.
+    join: {"table": "ft_point_band", "on": ["entity_id", "period"]} menggabung tabel kedua; kolom tabel kedua diawali b.
+    (mis. "b.ndvi"). Kolom array: array="mean"|"max"|"min" meringkas tiap baris dulu, at=n mengambil elemen ke-n.
     """
+    other = resolve_join_table(full_name, join.table) if join else None
     return with_columns(
-        full_name, lambda known: build_aggregate(full_name, known, metrics, group_by, filters, order_by, desc, limit)
+        full_name,
+        lambda known, other_cols: build_aggregate(
+            full_name, known, metrics, group_by, filters, order_by, desc, limit, join, other, other_cols
+        ),
+        other,
     )
 
 

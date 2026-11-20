@@ -12,7 +12,7 @@ Spesifikasi lengkap ada di `docs/2026-10-30-mody-mcp-generik-design.md`.
 | `describe_table(full_name, include_samples=False)` | Kolom, tipe, komentar; opsional nilai contoh kolom teks | opsional |
 | `preview_table(full_name, limit=20)` | Contoh baris | ya |
 | `query_table(full_name, columns, filters, order_by, desc, limit, sample)` | Baris yang disaring, `sample=True` untuk sampel acak | ya |
-| `aggregate_table(full_name, metrics, group_by, filters, order_by, desc, limit)` | Agregat (count/count_distinct/avg/min/max/sum/stddev/median) per kelompok | ya |
+| `aggregate_table(full_name, metrics, group_by, filters, order_by, desc, limit, join)` | Agregat (count/count_distinct/avg/min/max/sum/stddev/median) per kelompok. `join` menggabung tabel kedua (kolom diawali `b.`) dalam catalog yang diizinkan; kolom array diringkas dengan `array`=mean/max/min atau `at`=n | ya |
 | `list_experiments(limit)` | Daftar experiment MLflow yang diizinkan | tidak |
 | `search_runs(experiment_path?, filter, order_by, metrics, limit)` | Run MLflow, tag git, dan metrik. `experiment_path` kosong = semua experiment yang diizinkan | tidak |
 | `get_run(run_id)` | Params, metrics, tags satu run | tidak |
