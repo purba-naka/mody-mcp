@@ -5,22 +5,13 @@ Spesifikasi lengkap ada di `docs/2026-10-30-mody-mcp-generik-design.md`.
 
 | Tool | Isi | Warehouse |
 |---|---|---|
-| `list_catalogs()` | Daftar catalog | tidak |
-| `list_schemas(catalog?)` | Daftar schema. `catalog` kosong = catalog tunggal yang diizinkan | tidak |
-| `list_tables(catalog?, schema?, include_columns=False)` | Daftar tabel. `schema` kosong = semua schema | tidak |
-| `list_models(catalog?, schema?)` | Daftar model terdaftar UC | tidak |
+| `list_tables(catalog?, schema?, include_columns=False)` | Daftar tabel. `catalog` kosong = catalog tunggal yang diizinkan, `schema` kosong = semua schema | tidak |
 | `describe_table(full_name, include_samples=False)` | Kolom, tipe, komentar; opsional nilai contoh kolom teks | opsional |
-| `preview_table(full_name, limit=20)` | Contoh baris | ya |
-| `query_table(full_name, columns, filters, order_by, desc, limit, sample)` | Baris yang disaring, `sample=True` untuk sampel acak | ya |
+| `query_table(full_name, columns, filters, order_by, desc, limit, sample)` | Baris mentah; tanpa filter = contoh baris, `sample=True` untuk sampel acak | ya |
 | `aggregate_table(full_name, metrics, group_by, filters, order_by, desc, limit, join)` | Agregat (count/count_distinct/avg/min/max/sum/stddev/median) per kelompok. `join` menggabung tabel kedua (kolom diawali `b.`) dalam catalog yang diizinkan; kolom array diringkas dengan `array`=mean/max/min atau `at`=n | ya |
-| `list_experiments(limit)` | Daftar experiment MLflow yang diizinkan | tidak |
-| `search_runs(experiment_path?, filter, order_by, metrics, limit)` | Run MLflow, tag git, dan metrik. `experiment_path` kosong = semua experiment yang diizinkan | tidak |
-| `get_run(run_id)` | Params, metrics, tags satu run | tidak |
-| `list_model_versions(full_name, limit, metrics)` | Versi model UC dan alias (`champion`), opsional metrik run | tidak |
-| `list_jobs(limit)` | Daftar job yang diizinkan | tidak |
-| `list_job_runs(job_name, limit)` | Run terakhir satu job | tidak |
-| `get_job_run(run_id)` | Status run dan tiap task | tidak |
-| `get_task_output(task_run_id)` | Error dan stack trace task | tidak |
+| `list_models(catalog?, schema?, full_name?, metrics, limit)` | Tanpa `full_name`: daftar model UC. Dengan `full_name`: versi, alias (`champion`), opsional metrik run | tidak |
+| `search_runs(experiment_path?, filter, order_by, metrics, limit, run_id?)` | Run MLflow, tag git, metrik. `experiment_path` kosong = semua experiment yang diizinkan. `limit=1` atau `run_id` = sertakan params/metrics/tags lengkap | tidak |
+| `job_runs(job_name?, run_id?, limit)` | Tanpa argumen: daftar job. `job_name`: run terakhir + detail run terbaru. `run_id`: detail satu run. Detail selalu menyertakan error dan trace task yang gagal | tidak |
 
 Tool MLflow dibatasi `ALLOWED_EXPERIMENT_PREFIX`, tool job dibatasi `ALLOWED_JOB_PREFIX`.
 
@@ -28,19 +19,15 @@ Tool MLflow dibatasi `ALLOWED_EXPERIMENT_PREFIX`, tool job dibatasi `ALLOWED_JOB
 
 | Tool | Isi |
 |---|---|
-| `github_list_files(path, ref)` | Isi folder, dengan kolom `editable` |
-| `github_read_file(path, ref)` | Isi file teks |
-| `github_create_branch(branch)` | Branch `agent/*` baru dari `GITHUB_BASE_BRANCH`, tidak menimpa yang sudah ada |
-| `github_commit_files(branch, message, files)` | Satu commit berisi beberapa file ke branch `agent/*` |
-| `github_create_pr(branch, title, body)` | Draft PR dari branch agent ke `GITHUB_BASE_BRANCH` |
+| `github_read(path, ref)` | Path folder = daftar isi dengan kolom `editable`, path file = isi file teks |
+| `github_commit_files(branch, message, files, pr_title?, pr_body?)` | Satu commit berisi beberapa file ke branch `agent/*` (branch dibuat kalau belum ada). `pr_title` diisi = sekaligus buka draft PR ke `GITHUB_BASE_BRANCH` |
 | `github_update_pr(number, title, body)` | Ubah PR milik agent |
-| `github_pr_status(number)` | State PR dan check CI |
-| `github_ci_log(job_id)` | Bagian akhir log job Actions |
+| `github_pr_status(number)` | State PR, check CI, dan bagian akhir log check yang gagal |
 
 Pembatas tulis: branch harus `GITHUB_BRANCH_PREFIX`, path harus cocok `GITHUB_ALLOWED_PATHS` dengan kedalaman folder
 yang sama, `.github/` dan `conftest.py`/`__init__.py`/`setup.py`/`pyproject.toml` selalu ditolak, maksimal 20 file
 atau 500.000 karakter per commit, update ref tanpa force, PR dari fork ditolak, PR selalu draft.
-`github_pr_status` dan `github_ci_log` hanya untuk branch agent. Merge tetap oleh manusia (tidak ada tool merge).
+`github_pr_status` hanya untuk PR dari branch agent. Merge tetap oleh manusia (tidak ada tool merge).
 
 Server menolak start kalau `MCP_API_KEY` kurang dari 32 karakter, atau `ALLOWED_CATALOGS`,
 `ALLOWED_EXPERIMENT_PREFIX`, `ALLOWED_JOB_PREFIX`, `GITHUB_BRANCH_PREFIX` kosong.

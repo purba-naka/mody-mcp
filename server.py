@@ -62,16 +62,11 @@ def redact(text: str) -> str:
 
 
 NOT_FOUND_HINTS = {
-    **dict.fromkeys(("describe_table", "preview_table", "query_table", "aggregate_table"), "Cek nama tabel dengan list_tables."),
-    "list_tables": "Cek nama catalog/schema dengan list_schemas.",
-    "list_schemas": "Cek nama catalog dengan list_catalogs.",
-    "list_models": "Cek nama schema dengan list_schemas.",
-    "list_model_versions": "Cek nama model dengan list_models.",
-    "search_runs": "Cek path dengan list_experiments.",
-    "get_run": "run_id MLflow berasal dari search_runs.",
-    "list_job_runs": "Cek nama job dengan list_jobs.",
-    "get_job_run": "run_id Job berasal dari list_job_runs.",
-    "get_task_output": "task_run_id berasal dari get_job_run.",
+    **dict.fromkeys(("describe_table", "query_table", "aggregate_table"), "Cek nama tabel dengan list_tables."),
+    "list_tables": "Kosongkan schema untuk melihat semua schema.",
+    "list_models": "Kosongkan full_name untuk daftar model.",
+    "search_runs": "Kosongkan experiment_path untuk mencari di semua experiment; run_id berasal dari hasil search_runs.",
+    "job_runs": "Kosongkan job_name dan run_id untuk daftar job.",
 }
 
 
@@ -216,24 +211,8 @@ def columns_table(columns: list[Any] | None, samples: dict[str, str] | None = No
 
 
 @mcp.tool()
-def list_catalogs() -> str:
-    """Daftar catalog Unity Catalog yang bisa diakses. Mulai dari sini kalau belum tahu nama catalog."""
-    allowed = allowed_catalogs()
-    rows = [[c.name, c.comment] for c in ws().catalogs.list() if c.name in allowed]
-    return md_table(["catalog", "comment"], rows)
-
-
-@mcp.tool()
-def list_schemas(catalog: str = "") -> str:
-    """Daftar schema di satu catalog, dengan komentarnya. catalog kosong = catalog tunggal yang diizinkan."""
-    catalog = resolve_catalog(catalog)
-    rows = [[s.name, s.comment] for s in ws().schemas.list(catalog_name=catalog)]
-    return f"Schema di {catalog} ({len(rows)}):\n" + md_table(["schema", "comment"], rows)
-
-
-@mcp.tool()
 def list_tables(catalog: str = "", schema: str = "", include_columns: bool = False) -> str:
-    """Daftar tabel. schema kosong = semua schema di catalog (satu panggilan, tanpa list_schemas dulu).
+    """Daftar tabel per schema. Kosongkan semua argumen = semua tabel di semua schema (cukup satu panggilan).
 
     catalog kosong = catalog tunggal yang diizinkan. include_columns=True menambah kolom tiap tabel (output panjang);
     untuk satu tabel pakai describe_table.
@@ -253,8 +232,16 @@ def list_tables(catalog: str = "", schema: str = "", include_columns: bool = Fal
 
 
 @mcp.tool()
-def list_models(catalog: str = "", schema: str = "") -> str:
-    """Daftar model terdaftar (Unity Catalog). schema kosong = semua schema. Pakai untuk mencari full_name sebelum list_model_versions."""
+def list_models(
+    catalog: str = "", schema: str = "", full_name: str = "", metrics: list[str] = [], limit: int = 20  # noqa: B006
+) -> str:
+    """Model terdaftar Unity Catalog. Tanpa full_name: daftar model (schema kosong = semua schema).
+
+    Dengan full_name (catalog.schema.model): versi model beserta alias (mis. champion), terbaru dulu.
+    metrics: nama metrik run tiap versi yang ditampilkan langsung (maksimal 10 versi).
+    """
+    if full_name:
+        return list_model_versions(full_name, limit, metrics)
     catalog = resolve_catalog(catalog)
     rows = []
     for sc in [schema] if schema else schema_names(catalog):
@@ -403,7 +390,7 @@ def run_query(sql: str, params: dict[str, str]) -> str:
     note = ""
     if not rows:
         note = (" - kosong. Cek nilai filter: kolom kategori biasanya berisi teks (mis. 'padi'), bukan angka. "
-                "Lihat nilai asli dengan preview_table")
+                "Lihat nilai asli dengan query_table tanpa filter")
     elif len(rows) >= max_rows() or truncated:
         note = f" - mencapai batas MAX_ROWS={max_rows()}, hasil mungkin terpotong. Pakai aggregate_table atau filter lebih sempit"
     return f"{len(rows)} baris{note}\n" + md_table(headers, rows)
@@ -448,15 +435,6 @@ def query(full_name: str, **kwargs: Any) -> str:
 
 
 @mcp.tool()
-def preview_table(full_name: str, limit: int = 20) -> str:
-    """Contoh baris mentah satu tabel tanpa filter, untuk melihat bentuk dan nilai asli kolom (mis. label teks).
-
-    full_name = catalog.schema.table. limit dibatasi MAX_ROWS server. Untuk statistik pakai aggregate_table.
-    """
-    return query(full_name, limit=limit)
-
-
-@mcp.tool()
 def query_table(
     full_name: str,
     columns: list[str] = [],  # noqa: B006
@@ -466,7 +444,8 @@ def query_table(
     limit: int = 20,
     sample: bool = False,
 ) -> str:
-    """Ambil baris mentah satu tabel (read-only). Untuk hitungan, rata-rata, distribusi pakai aggregate_table.
+    """Ambil baris mentah satu tabel (read-only); tanpa argumen lain = contoh baris untuk melihat nilai asli kolom.
+    Untuk hitungan, rata-rata, distribusi pakai aggregate_table.
 
     columns: kosong = semua. filters: digabung AND, mis. [{"column": "scope", "op": "=", "value": "production"}]; IN pakai list.
     order_by + desc: urutan. sample=True: sampel acak (tanpa order_by). limit dibatasi MAX_ROWS.
@@ -656,7 +635,7 @@ def check_experiment(name: str) -> None:
     prefix = normalize_experiment(experiment_prefix())
     path = normalize_experiment(name)
     if prefix and (not path.startswith(prefix) or ".." in path.split("/")):
-        raise ValueError(f"Experiment '{name}' tidak diizinkan. Harus berawalan '{prefix}'. Lihat daftar dengan list_experiments")
+        raise ValueError(f"Experiment '{name}' tidak diizinkan. Harus berawalan '{prefix}'. Kosongkan experiment_path untuk mencari di semua experiment")
 
 
 MAX_SEARCH_EXPERIMENTS = 20
@@ -673,31 +652,25 @@ def allowed_experiments(limit: int) -> list[Any]:
 
 
 @mcp.tool()
-def list_experiments(limit: int = 50) -> str:
-    """Daftar experiment MLflow yang boleh diakses (awalan ALLOWED_EXPERIMENT_PREFIX).
-
-    Pakai ini untuk mencari experiment_path sebelum search_runs. Jangan menebak path.
-    """
-    found = allowed_experiments(clamp(limit))
-    rows = [[e.name, ts(e.last_update_time)] for e in found]
-    return f"{len(rows)} experiment\n" + md_table(["experiment_path", "last_update"], rows)
-
-
-@mcp.tool()
 def search_runs(
     experiment_path: str = "",
     filter: str = "",
     order_by: str = "",
     metrics: list[str] = [],  # noqa: B006
     limit: int = 10,
+    run_id: str = "",
 ) -> str:
-    """Daftar run MLflow (bukan Job Databricks), terbaru dulu.
+    """Run MLflow (bukan Job Databricks), terbaru dulu. Kolom experiment menunjukkan path experiment.
 
-    experiment_path kosong = cari di semua experiment yang diizinkan sekaligus (tidak perlu list_experiments dulu).
+    experiment_path kosong = cari di semua experiment yang diizinkan sekaligus.
     filter: sintaks MLflow, mis. "tags.git_branch = 'agent/x'" atau "metrics.macro_f1 > 0.7".
     order_by: mis. "metrics.macro_f1 DESC". Untuk mencari run terbaik: order_by metrik + limit kecil
     (nama metrik ada di baris "metrik tersedia"). metrics: metrik yang ditampilkan, kosong = semua.
+    limit=1 menyertakan detail lengkap (params, metrics, tags) run teratas.
+    run_id: detail lengkap satu run (argumen lain diabaikan).
     """
+    if run_id:
+        return get_run(run_id)
     if experiment_path:
         check_experiment(experiment_path)
         experiments = [ws().experiments.get_by_name(normalize_experiment(experiment_path)).experiment]
@@ -731,14 +704,16 @@ def search_runs(
     head = f"{len(rows)} run di " + (f"{len(experiments)} experiment" if multi else experiments[0].name)
     if available:
         head += f"\nmetrik tersedia: {', '.join(sorted(available)[:MAX_METRIC_NAMES])}"
-    return head + "\n" + md_table(
+    out = head + "\n" + md_table(
         [*(["experiment"] if multi else []), "run_id", "run_name", "status", "start", *RUN_TAGS, "metrics"], rows
     )
+    if clamp(limit) == 1 and rows:
+        out += "\n\n" + get_run(rows[0][1 if multi else 0])
+    return out
 
 
-@mcp.tool()
 def get_run(run_id: str) -> str:
-    """Detail satu run MLflow (run_id string dari search_runs, bukan run Job): params, metrics, tags."""
+    """Detail satu run MLflow: params, metrics, tags. Hanya run dari experiment yang diizinkan."""
     run = ws().experiments.get_run(run_id).run
     experiment = ws().experiments.get_experiment(run.info.experiment_id).experiment
     check_experiment(experiment.name)
@@ -781,12 +756,8 @@ def run_metrics(run_id: str | None, wanted: list[str], allowed: dict[str, bool])
     return shown or f"(tidak ada {'/'.join(wanted)}; tersedia: {', '.join(sorted(values)[:8]) or '-'})"
 
 
-@mcp.tool()
 def list_model_versions(full_name: str, limit: int = 20, metrics: list[str] = []) -> str:  # noqa: B006
-    """Versi model Unity Catalog beserta alias (mis. champion), terbaru dulu. full_name = catalog.schema.model.
-
-    metrics: nama metrik run tiap versi yang ingin ditampilkan langsung (maksimal 10 versi), tanpa get_run satu per satu.
-    """
+    """Versi model Unity Catalog beserta alias, terbaru dulu. Dipakai list_models(full_name=...)."""
     split_full_name(full_name)
     model = ws().registered_models.get(full_name, include_aliases=True)
     aliases: dict[int, list[str]] = {}
@@ -848,12 +819,29 @@ def job_params(run: Any) -> dict[str, str]:
     return {p.name: p.value if p.value is not None else p.default for p in run.job_parameters or []}
 
 
-@mcp.tool()
-def list_jobs(limit: int = 50) -> str:
-    """Daftar job Databricks yang boleh diakses (awalan ALLOWED_JOB_PREFIX).
+FAILED_STATES = {"FAILED", "TIMEDOUT", "INTERNAL_ERROR"}
+MAX_FAILED_TASKS = 3
+TASK_TRACE_TAIL = 1500
 
-    Pakai ini untuk mencari job_name sebelum list_job_runs. Jangan menebak nama job.
+
+@mcp.tool()
+def job_runs(job_name: str = "", run_id: int = 0, limit: int = 10) -> str:
+    """Job Databricks (awalan ALLOWED_JOB_PREFIX), bukan run MLflow. Satu panggilan untuk tiap kebutuhan:
+
+    - tanpa argumen: daftar job.
+    - job_name (mis. mody_train_dev): run terakhir job itu + detail run terbaru (params, tasks, error dan trace task gagal).
+    - run_id (angka): detail satu run beserta error task yang gagal.
+    Kolom overrides berisi parameter yang diubah dari default.
     """
+    if run_id:
+        return get_job_run(run_id)
+    if not job_name:
+        return list_jobs(limit=50)
+    listing, latest = list_job_runs(job_name, limit)
+    return listing + (f"\n\n{get_job_run(latest)}" if latest else "")
+
+
+def list_jobs(limit: int = 50) -> str:
     prefix, scanned, rows = job_prefix(), 0, []
     for j in ws().jobs.list(limit=100):
         scanned += 1
@@ -863,33 +851,29 @@ def list_jobs(limit: int = 50) -> str:
             break
     note = ""
     if len(rows) < clamp(limit) and scanned >= MAX_JOB_SCAN:
-        note = f" - hanya {MAX_JOB_SCAN} job pertama diperiksa, daftar mungkin tidak lengkap. Kalau tahu namanya, langsung pakai list_job_runs"
+        note = f" - hanya {MAX_JOB_SCAN} job pertama diperiksa, daftar mungkin tidak lengkap. Kalau tahu namanya, langsung isi job_name"
     return f"{len(rows)} job{note}\n" + md_table(["job_name", "job_id"], rows)
 
 
-@mcp.tool()
-def list_job_runs(job_name: str, limit: int = 10) -> str:
-    """Run terakhir satu job, misalnya mody_train_dev. Kolom overrides berisi parameter yang diubah dari default."""
+def list_job_runs(job_name: str, limit: int = 10) -> tuple[str, int | None]:
+    """Tabel run terakhir satu job dan run_id terbaru (None kalau belum pernah jalan)."""
     check_job_name(job_name)
     job = next(iter(ws().jobs.list(name=job_name)), None)
     if job is None:
-        raise ValueError(f"Job '{job_name}' tidak ditemukan. Lihat daftar dengan list_jobs")
-    runs = islice(ws().jobs.list_runs(job_id=job.job_id, limit=min(clamp(limit), 25)), clamp(limit))
+        raise ValueError(f"Job '{job_name}' tidak ditemukan. Kosongkan job_name untuk daftar job")
+    runs = list(islice(ws().jobs.list_runs(job_id=job.job_id, limit=min(clamp(limit), 25)), clamp(limit)))
     rows = [
         [r.run_id, run_state(r.state), ts(r.start_time), duration(r.start_time, r.end_time),
          r.trigger.value if r.trigger else None,
          ", ".join(f"{p.name}={p.value}" for p in r.job_parameters or [] if p.value not in (None, p.default))]
         for r in runs
     ]
-    return f"{len(rows)} run {job_name}\n" + md_table(["run_id", "state", "start", "durasi", "trigger", "overrides"], rows)
+    table = f"{len(rows)} run {job_name}\n" + md_table(["run_id", "state", "start", "durasi", "trigger", "overrides"], rows)
+    return table, runs[0].run_id if runs else None
 
 
-@mcp.tool()
 def get_job_run(run_id: int) -> str:
-    """Status satu run Job Databricks (run_id angka dari list_job_runs, bukan run MLflow) dan tiap task-nya. Pakai task_run_id dari sini di get_task_output untuk melihat error.
-
-    Run yang di-repair menampilkan semua attempt. State run mengikuti repair terakhir.
-    """
+    """Status satu run dan tiap task-nya, plus error task yang gagal. Run yang di-repair menampilkan semua attempt."""
     run = ws().jobs.get_run(run_id, include_history=True)
     name = check_job_id(run.job_id)
     tasks = sorted(run.tasks or [], key=lambda t: (t.start_time or 0, t.attempt_number or 0))
@@ -899,6 +883,8 @@ def get_job_run(run_id: int) -> str:
         + ", ".join(cell(run_state(h.state)) for h in (run.repair_history or [])[:-1])
         if repairs else "-"
     )
+    failed = [t for t in tasks if run_state(t.state) in FAILED_STATES][-MAX_FAILED_TASKS:]
+    errors = "".join(f"\n\n{get_task_output(t.run_id, checked=True, tail=TASK_TRACE_TAIL)}" for t in failed)
     return (
         f"## {name} run {run.run_id}\n"
         f"- state: {cell(run_state(run.state))}, start: {cell(ts(run.start_time))}, "
@@ -913,23 +899,24 @@ def get_job_run(run_id: int) -> str:
             [[t.task_key, t.run_id, t.attempt_number, run_state(t.state), ts(t.start_time),
               duration(t.start_time, t.end_time)] for t in tasks],
         )
+        + errors
     )
 
 
-@mcp.tool()
-def get_task_output(task_run_id: int) -> str:
-    """Error dan stack trace satu task (task_run_id dari get_job_run). Trace dipotong ke bagian akhir."""
+def get_task_output(task_run_id: int, checked: bool = False, tail: int = TRACE_TAIL) -> str:
+    """Error dan stack trace satu task, dipotong ke bagian akhir. checked=True: job sudah diverifikasi pemanggil."""
     out = ws().jobs.get_run_output(task_run_id)
-    check_job_id(out.metadata.job_id if out.metadata else None)
+    if not checked:
+        check_job_id(out.metadata.job_id if out.metadata else None)
     error = plain(out.error) or "(tidak ada error)"
     trace = plain(out.error_trace)
-    if len(trace) > TRACE_TAIL:
-        trace = "...\n" + trace[-TRACE_TAIL:]
+    if len(trace) > tail:
+        trace = "...\n" + trace[-tail:]
     state = run_state(out.metadata.state if out.metadata else None)
     return (
-        f"## task run {task_run_id}\n- state: {cell(state)}\n\n"
-        f"### error\n{error}\n\n"
-        f"### trace\n```\n{trace or '(kosong)'}\n```"
+        f"### task run {task_run_id} ({cell(state)})\n"
+        f"error: {error}\n"
+        f"```\n{trace or '(trace kosong)'}\n```"
     )
 
 
@@ -1046,30 +1033,20 @@ def ref_params(ref: str) -> dict[str, str] | None:
 
 
 @mcp.tool()
-def github_list_files(path: str = "", ref: str = "") -> str:
-    """Isi satu folder di repo. path kosong = root. ref = branch atau commit, kosong = branch utama.
+def github_read(path: str = "", ref: str = "") -> str:
+    """Baca repo: path folder = daftar isi (path kosong = root), path file = isi file teks (file panjang dipotong).
 
-    Kolom editable = yes kalau file boleh diubah lewat github_commit_files.
+    ref = branch atau commit, kosong = branch utama. editable = yes kalau boleh diubah lewat github_commit_files.
     """
     if path:
         check_relative(path)
-    items = gh_call("GET", f"/contents/{path}", params=ref_params(ref)).json()
-    if not isinstance(items, list):
-        raise ValueError(f"'{path}' adalah file, pakai github_read_file")  # noqa: TRY004
-    rows = [
-        [i["type"], i["path"], i["size"] if i["type"] == "file" else None, "yes" if is_writable(i["path"]) else "no"]
-        for i in items
-    ]
-    return f"{len(rows)} entri di /{path}\n" + md_table(["type", "path", "size", "editable"], rows)
-
-
-@mcp.tool()
-def github_read_file(path: str, ref: str = "") -> str:
-    """Isi satu file teks di repo. ref = branch atau commit, kosong = branch utama. File panjang dipotong."""
-    check_relative(path)
     item = gh_call("GET", f"/contents/{path}", params=ref_params(ref)).json()
     if isinstance(item, list):
-        raise ValueError(f"'{path}' adalah folder, pakai github_list_files")  # noqa: TRY004
+        rows = [
+            [i["type"], i["path"], i["size"] if i["type"] == "file" else None, "yes" if is_writable(i["path"]) else "no"]
+            for i in item
+        ]
+        return f"{len(rows)} entri di /{path}\n" + md_table(["type", "path", "size", "editable"], rows)
     if item.get("encoding") != "base64":
         raise ValueError(f"'{path}' terlalu besar untuk dibaca lewat API ({item.get('size')} byte)")
     try:
@@ -1084,23 +1061,12 @@ def github_read_file(path: str, ref: str = "") -> str:
 
 
 @mcp.tool()
-def github_create_branch(branch: str) -> str:
-    """Buat branch agent dari ujung branch utama. Gagal kalau branch sudah ada (tidak pernah menimpa)."""
-    check_branch(branch)
-    if branch_sha(branch) is not None:
-        raise ValueError(f"Branch '{branch}' sudah ada")
-    sha = branch_sha(base_branch())
-    if sha is None:
-        raise ValueError(f"Branch utama '{base_branch()}' tidak ditemukan")
-    gh_call("POST", "/git/refs", json={"ref": f"refs/heads/{branch}", "sha": sha})
-    return f"Branch {branch} dibuat dari {base_branch()} ({sha[:12]})"
-
-@mcp.tool()
-def github_commit_files(branch: str, message: str, files: list[FileChange]) -> str:
+def github_commit_files(branch: str, message: str, files: list[FileChange], pr_title: str = "", pr_body: str = "") -> str:
     """Satu commit berisi satu atau beberapa file ke branch agent. Branch dibuat dari branch utama kalau belum ada.
 
     files: [{"path": "usecases/<uc>/usecase.yml", "content": "<isi lengkap file>"}]. content null = hapus file.
     Isi file ditulis utuh (bukan diff). Hanya path dengan editable = yes yang diterima.
+    pr_title diisi = sekaligus buka draft PR ke branch utama (review dan merge oleh manusia).
     """
     check_branch(branch)
     paths = [f.path for f in files]
@@ -1131,11 +1097,19 @@ def github_commit_files(branch: str, message: str, files: list[FileChange]) -> s
     else:
         gh_call("PATCH", f"/git/refs/heads/{branch}", json={"sha": commit["sha"], "force": False})
 
-    return (
+    out = (
         f"Commit {commit['sha'][:12]} ke {branch}{' (branch baru)' if is_new else ''}\n"
         f"- url: {commit.get('html_url')}\n\n"
         + md_table(["path", "aksi"], [[f.path, "hapus" if f.content is None else "tulis"] for f in files])
     )
+    if pr_title.strip():
+        try:
+            out += "\n\n" + github_create_pr(branch, pr_title, pr_body)
+        except GitHubError as e:
+            if e.status != 422:
+                raise
+            out += "\n\nPR tidak dibuka: kemungkinan sudah ada PR untuk branch ini (pakai github_update_pr)"
+    return out
 
 
 def agent_pr(number: int) -> dict[str, Any]:
@@ -1147,9 +1121,8 @@ def agent_pr(number: int) -> dict[str, Any]:
     return pr
 
 
-@mcp.tool()
 def github_create_pr(branch: str, title: str, body: str) -> str:
-    """Buka draft pull request dari branch agent ke branch utama. Ready for review, review, dan merge oleh manusia."""
+    """Buka draft pull request dari branch agent ke branch utama."""
     check_branch(branch)
     pr = gh_call(
         "POST", "/pulls", json={"head": branch, "base": base_branch(), "title": title, "body": body, "draft": True}
@@ -1168,11 +1141,18 @@ def github_update_pr(number: int, title: str | None = None, body: str | None = N
     return f"PR #{number} diperbarui: {pr['html_url']}"
 
 
+FAILED_CONCLUSIONS = {"failure", "timed_out", "startup_failure"}
+MAX_FAILED_LOGS = 3
+CI_LOG_TAIL = 1500
+
+
 @mcp.tool()
 def github_pr_status(number: int) -> str:
-    """Status PR dan check CI di commit terakhirnya. job_id check yang gagal dipakai di github_ci_log."""
+    """Status PR agent dan check CI di commit terakhirnya, termasuk bagian akhir log check yang gagal (tanpa panggilan lain)."""
     pr = agent_pr(number)
     checks = gh_call("GET", f"/commits/{pr['head']['sha']}/check-runs", params={"per_page": 50}).json()["check_runs"]
+    failed = [c for c in checks if c.get("conclusion") in FAILED_CONCLUSIONS][:MAX_FAILED_LOGS]
+    logs = "".join(f"\n\n{github_ci_log(c['id'], checked=True, tail=CI_LOG_TAIL, name=c['name'])}" for c in failed)
     return (
         f"## PR #{number} {cell(pr['title'])}\n"
         f"- state: {pr['state']}{' (draft)' if pr.get('draft') else ''}, merged: {cell(pr.get('merged'))}, "
@@ -1182,17 +1162,24 @@ def github_pr_status(number: int) -> str:
         f"### checks ({len(checks)})\n"
         + md_table(["name", "status", "conclusion", "job_id"],
                    [[c["name"], c["status"], c.get("conclusion"), c["id"]] for c in checks])
+        + logs
     )
 
 
-@mcp.tool()
-def github_ci_log(job_id: int) -> str:
-    """Bagian akhir log satu job GitHub Actions (job_id dari github_pr_status), tanpa timestamp dan kode warna."""
-    check_branch(gh_call("GET", f"/actions/jobs/{job_id}").json().get("head_branch") or "")
-    log = LOG_TIMESTAMP.sub("", plain(gh_call("GET", f"/actions/jobs/{job_id}/logs").text))
-    if len(log) > TRACE_TAIL:
-        log = "...\n" + log[-TRACE_TAIL:]
-    return f"## log job {job_id}\n```\n{log or '(kosong)'}\n```"
+def github_ci_log(job_id: int, checked: bool = False, tail: int = TRACE_TAIL, name: str = "") -> str:
+    """Bagian akhir log satu job GitHub Actions, tanpa timestamp dan kode warna. checked=True: job dari PR agent."""
+    if not checked:
+        check_branch(gh_call("GET", f"/actions/jobs/{job_id}").json().get("head_branch") or "")
+    title = f"### log {name} (job {job_id})" if name else f"### log job {job_id}"
+    try:
+        log = LOG_TIMESTAMP.sub("", plain(gh_call("GET", f"/actions/jobs/{job_id}/logs").text))
+    except GitHubError as e:
+        if not checked or e.status not in (404, 410):
+            raise
+        return f"{title}\n(log tidak tersedia, mungkin check bukan GitHub Actions atau sudah kedaluwarsa)"
+    if len(log) > tail:
+        log = "...\n" + log[-tail:]
+    return f"{title}\n```\n{log or '(kosong)'}\n```"
 
 
 # ---------- HTTP ----------

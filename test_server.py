@@ -90,14 +90,9 @@ def test_full_name_validated(name):
         server.split_full_name(name)
 
 
-def test_list_catalogs_filtered(fake):
-    out = server.list_catalogs()
-    assert "mody_dev" in out and "main" not in out
-
-
-def test_list_schemas_rejects_other_catalog(fake):
+def test_list_tables_rejects_other_catalog(fake):
     with pytest.raises(ValueError, match="tidak diizinkan"):
-        server.list_schemas("main")
+        server.list_tables("main")
 
 
 def test_describe_table(fake):
@@ -123,7 +118,7 @@ def test_query_failure_reported(fake):
     fake.statement_execution.execute_statement = lambda **kw: NS(
         status=NS(state=server.StatementState.FAILED, error=NS(message="TABLE_OR_VIEW_NOT_FOUND")))
     with pytest.raises(RuntimeError, match="FAILED: TABLE_OR_VIEW_NOT_FOUND"):
-        server.preview_table(TBL)
+        server.query_table(TBL)
 
 
 KEY = "k" * 32
@@ -143,11 +138,8 @@ def test_bearer_auth():
         assert ok.status_code == 200
         names = {t["name"] for t in ok.json()["result"]["tools"]}
         assert names == {
-            "list_catalogs", "list_schemas", "list_tables", "describe_table", "preview_table", "query_table",
-            "search_runs", "get_run", "list_model_versions", "list_job_runs", "get_job_run", "get_task_output",
-            "github_list_files", "github_read_file", "github_create_branch", "github_commit_files", "github_create_pr", "github_update_pr",
-            "github_pr_status", "github_ci_log",
-                "aggregate_table", "list_models", "list_experiments", "list_jobs",
+            "list_tables", "describe_table", "query_table", "aggregate_table", "list_models", "search_runs", "job_runs",
+            "github_read", "github_commit_files", "github_update_pr", "github_pr_status",
         }
 
 
@@ -187,9 +179,9 @@ def test_tool_call_audited_without_values(fake, caplog):
     import asyncio
     caplog.set_level("INFO", logger="mody_mcp.audit")
     with pytest.raises(Exception):  # noqa: B017
-        asyncio.run(server.mcp.call_tool("list_schemas", {"catalog": "rahasia_pii"}))
+        asyncio.run(server.mcp.call_tool("list_tables", {"catalog": "rahasia_pii"}))
     rec = json.loads(caplog.records[-1].getMessage())
-    assert rec["tool"] == "list_schemas" and rec["arg_keys"] == ["catalog"] and rec["outcome"] != "ok"
+    assert rec["tool"] == "list_tables" and rec["arg_keys"] == ["catalog"] and rec["outcome"] != "ok"
     assert "rahasia_pii" not in caplog.text
 
 
@@ -265,7 +257,21 @@ def test_get_run(mlflow_fake):
 
 def test_get_run_rejects_run_from_other_experiment(mlflow_fake):
     with pytest.raises(ValueError, match="tidak diizinkan"):
-        server.get_run("foreign")
+        server.search_runs(run_id="foreign")
+
+
+def test_search_runs_run_id_returns_detail(mlflow_fake):
+    assert "| lr | 0.001 |" in server.search_runs(run_id="r1")
+
+
+def test_search_runs_limit_one_includes_detail(mlflow_fake):
+    out = server.search_runs(EXP, limit=1)
+    assert "## run r1" in out and "| lr | 0.001 |" in out
+    assert "## run" not in server.search_runs(EXP, limit=2)
+
+
+def test_list_models_with_full_name_lists_versions(mlflow_fake):
+    assert server.list_models(full_name=MODEL, limit=2).startswith(f"2 versi {MODEL}")
 
 
 def test_list_model_versions(mlflow_fake):
@@ -313,20 +319,40 @@ def jobs_fake(fake):
     return fake
 
 
-def test_list_job_runs(jobs_fake):
-    out = server.list_job_runs("mody_train_dev")
+def test_job_runs_by_name_includes_latest_detail_and_errors(jobs_fake):
+    out = server.job_runs("mody_train_dev")
     assert out.startswith("1 run mody_train_dev")
     assert "| 100 | FAILED | 2026-10-26 04:14 UTC " in out and "| 1m01s | ONE_TIME | model_label=15A |" in out
+    assert "## mody_train_dev run 100" in out and "ValueError: kolom hilang" in out
+    assert "x" * (server.TASK_TRACE_TAIL + 1) not in out
+
+
+def test_job_runs_by_run_id(jobs_fake):
+    out = server.job_runs(run_id=100)
+    assert out.startswith("## mody_train_dev run 100") and "### task run 11 (FAILED)" in out
+
+
+def test_job_runs_without_args_lists_jobs(jobs_fake):
+    jobs_fake.jobs.list = lambda limit=None: [NS(job_id=1, settings=NS(name="mody_train_dev"))]
+    assert "mody_train_dev" in server.job_runs()
+
+
+def test_job_run_skips_output_for_successful_tasks(jobs_fake):
+    jobs_fake.jobs.get_run_output = lambda run_id: pytest.fail("tidak boleh dipanggil")
+    run = jobs_fake.jobs.get_run(100, include_history=True)
+    run.tasks[0].state = job_state("SUCCESS")
+    jobs_fake.jobs.get_run = lambda run_id, include_history: run
+    assert "### task run" not in server.job_runs(run_id=100)
 
 
 @pytest.mark.parametrize("name, msg", [("airbyte_sync", "tidak diizinkan"), ("mody_missing", "tidak ditemukan")])
 def test_list_job_runs_rejects(jobs_fake, name, msg):
     with pytest.raises(ValueError, match=msg):
-        server.list_job_runs(name)
+        server.job_runs(name)
 
 
 def test_get_job_run(jobs_fake):
-    out = server.get_job_run(100)
+    out = server.job_runs(run_id=100)
     assert out.startswith("## mody_train_dev run 100")
     assert "| env | dev |" in out and "| model_label | 15A |" in out  # default dipakai kalau value kosong
     assert "| train | 11 | 0 | FAILED |" in out
@@ -339,7 +365,7 @@ def test_get_task_output(jobs_fake):
     assert out.count("x") <= server.TRACE_TAIL and "END" in out and "\x1b" not in out
 
 
-@pytest.mark.parametrize("call", [lambda: server.get_job_run(999), lambda: server.get_task_output(999)])
+@pytest.mark.parametrize("call", [lambda: server.job_runs(run_id=999), lambda: server.get_task_output(999)])
 def test_job_run_from_other_job_rejected(jobs_fake, call):
     with pytest.raises(ValueError, match="tidak diizinkan"):
         call()
@@ -454,28 +480,15 @@ def test_branch_rejected(branch):
         server.check_branch(branch)
 
 
-def test_list_files_marks_editable(github):
-    out = server.github_list_files("usecases")
+def test_github_read_folder_marks_editable(github):
+    out = server.github_read("usecases")
     assert "| dir | usecases/geo_commodity_classification | - | no |" in out
-    assert "| file | .github/workflows/ci.yml | 10 | no |" in server.github_list_files(".github/workflows")
+    assert "| file | .github/workflows/ci.yml | 10 | no |" in server.github_read(".github/workflows")
 
 
-def test_read_file(github):
-    out = server.github_read_file(YML)
+def test_github_read_file(github):
+    out = server.github_read(YML)
     assert f"## {YML} (main, editable: yes)" in out and "epochs: 50" in out
-
-
-def test_create_branch(github):
-    assert server.github_create_branch("agent/new") == "Branch agent/new dibuat dari main (sha-main)"
-    assert github.writes == [("POST", "/git/refs", {"ref": "refs/heads/agent/new", "sha": "sha-main"})]
-
-
-@pytest.mark.parametrize("branch, msg", [("agent/tune", "sudah ada"), ("main", "tidak diizinkan")])
-def test_create_branch_rejected(github, branch, msg):
-    github.branches["agent/tune"] = "sha-tune"
-    with pytest.raises(ValueError, match=msg):
-        server.github_create_branch(branch)
-    assert github.writes == []
 
 
 def test_commit_creates_branch_from_main(github):
@@ -512,6 +525,19 @@ def test_commit_rejected_before_any_write(github, branch, files, msg):
     assert github.writes == []
 
 
+def test_commit_with_pr_title_opens_draft_pr(github):
+    out = server.github_commit_files("agent/new", "tune", [server.FileChange(path=YML, content="x")],
+                                     pr_title="Tune", pr_body="hipotesis")
+    assert "PR #8 dibuka (draft)" in out
+    assert github.writes[-1] == ("POST", "/pulls", {"head": "agent/new", "base": "main", "title": "Tune",
+                                                    "body": "hipotesis", "draft": True})
+
+
+def test_commit_without_pr_title_opens_no_pr(github):
+    server.github_commit_files("agent/new", "tune", [server.FileChange(path=YML, content="x")])
+    assert all(path != "/pulls" for _, path, _ in github.writes)
+
+
 def test_create_pr_is_draft_to_main(github):
     assert server.github_create_pr("agent/tune", "Tune", "hipotesis") == "PR #8 dibuka (draft): https://github.com/pr/8"
     assert github.writes == [("POST", "/pulls", {"head": "agent/tune", "base": "main", "title": "Tune",
@@ -535,6 +561,7 @@ def test_update_pr_rejects_non_agent_pr(github, head):
 def test_pr_status_and_ci_log(github):
     out = server.github_pr_status(7)
     assert "- state: open (draft)" in out and "| test | completed | failure | 99 |" in out
+    assert "### log test (job 99)" in out and "FAILED test_x" in out and "\x1b" not in out
     log = server.github_ci_log(99)
     assert "FAILED test_x" in log and "2026-11-03T" not in log and "\x1b" not in log
 
@@ -554,7 +581,7 @@ def test_ci_log_rejects_non_agent_job(github, branch):
 
 def test_github_error_reported(github):
     with pytest.raises(server.GitHubError, match="404 Not Found"):
-        server.github_read_file("src/missing.py")
+        server.github_read("src/missing.py")
 
 
 # ---------- optimasi tool calling ----------
@@ -609,17 +636,17 @@ def test_zero_rows_hint(fake):
     fake.statement_execution.execute_statement = lambda **kw: NS(
         status=NS(state=server.StatementState.SUCCEEDED, error=None),
         manifest=NS(schema=NS(columns=[NS(name="scope")])), result=NS(data_array=[]))
-    assert "preview_table" in server.preview_table(TBL).splitlines()[0]
+    assert "query_table tanpa filter" in server.query_table(TBL).splitlines()[0]
 
 
 def test_truncation_flagged(fake, monkeypatch):
     monkeypatch.setenv("MAX_ROWS", "2")
-    first = server.preview_table(TBL).splitlines()[0]
+    first = server.query_table(TBL).splitlines()[0]
     assert "MAX_ROWS=2" in first and "aggregate_table" in first
 
 
 def test_no_truncation_note_below_limit(fake):
-    assert server.preview_table(TBL).splitlines()[0] == "2 baris"
+    assert server.query_table(TBL).splitlines()[0] == "2 baris"
 
 
 def test_list_models(fake):
@@ -629,7 +656,7 @@ def test_list_models(fake):
         server.list_models("main", "core")
 
 
-def test_list_experiments_filters_on_server_and_prefix(mlflow_fake):
+def test_allowed_experiments_filters_on_server_and_prefix(mlflow_fake):
     seen = {}
 
     def search(filter=None, order_by=None, max_results=None):
@@ -637,9 +664,9 @@ def test_list_experiments_filters_on_server_and_prefix(mlflow_fake):
         return [NS(name="/Shared/mody/a", last_update_time=0), NS(name="/Shared/other/b", last_update_time=0)]
 
     mlflow_fake.experiments.search_experiments = search
-    out = server.list_experiments(limit=5)
+    names = [e.name for e in server.allowed_experiments(5)]
     assert seen["filter"] == "name LIKE '/Shared/mody/%'" and seen["max_results"] == 10
-    assert "/Shared/mody/a" in out and "other" not in out
+    assert names == ["/Shared/mody/a"]
 
 
 def test_list_jobs_only_allowed_prefix(jobs_fake):
@@ -660,13 +687,13 @@ def test_list_jobs_stops_scanning(jobs_fake, monkeypatch):
 
     jobs_fake.jobs.list = lambda limit=None: jobs()
     out = server.list_jobs()
-    assert len(pulled) == 3 and "tidak lengkap" in out and "list_job_runs" in out
+    assert len(pulled) == 3 and "tidak lengkap" in out and "job_name" in out
 
 
 def test_audit_records_result_size(fake, caplog):
     import asyncio
     caplog.set_level("INFO", logger="mody_mcp.audit")
-    asyncio.run(server.mcp.call_tool("list_catalogs", {}))
+    asyncio.run(server.mcp.call_tool("describe_table", {"full_name": TBL}))
     assert json.loads(caplog.records[-1].getMessage())["result_chars"] > 0
 
 
@@ -690,8 +717,8 @@ def test_unauthenticated_error_is_sanitized(fake):
     def boom():
         raise Unauthenticated(LEAK)
 
-    fake.catalogs = NS(list=boom)
-    msg = call_error("list_catalogs", {})
+    fake.tables = NS(get=lambda full_name: boom())
+    msg = call_error("describe_table", {"full_name": TBL})
     assert not any(s in msg for s in SECRETS)
     assert "autentikasi Databricks gagal" in msg and "error_id:" in msg
 
@@ -711,13 +738,13 @@ def test_unknown_exception_is_generic(fake):
     def boom():
         raise KeyError("http://internal.corp/secret")
 
-    fake.catalogs = NS(list=boom)
-    msg = call_error("list_catalogs", {})
+    fake.tables = NS(get=lambda full_name: boom())
+    msg = call_error("describe_table", {"full_name": TBL})
     assert "internal.corp" not in msg and "kesalahan internal server" in msg
 
 
 def test_our_own_errors_keep_message(fake):
-    assert "tidak diizinkan" in call_error("list_schemas", {"catalog": "main"})
+    assert "tidak diizinkan" in call_error("list_tables", {"catalog": "main"})
 
 
 def test_audit_outcome_records_real_cause(fake, caplog):
@@ -727,8 +754,8 @@ def test_audit_outcome_records_real_cause(fake, caplog):
     def boom():
         raise Unauthenticated(LEAK)
 
-    fake.catalogs = NS(list=boom)
-    call_error("list_catalogs", {})
+    fake.tables = NS(get=lambda full_name: boom())
+    call_error("describe_table", {"full_name": TBL})
     rec = json.loads([r for r in caplog.records if r.name == "mody_mcp.audit"][-1].getMessage())
     assert rec["outcome"] == "Unauthenticated"
 
@@ -738,13 +765,14 @@ def test_audit_outcome_records_real_cause(fake, caplog):
 
 def test_single_allowed_catalog_is_default(fake):
     fake.schemas = NS(list=lambda catalog_name: [NS(name="core", comment=None)])
-    assert "Schema di mody_dev (1)" in server.list_schemas()
+    fake.tables = NS(list=lambda catalog_name, schema_name, omit_columns: [])
+    assert "Tabel di mody_dev.core (0)" in server.list_tables()
 
 
 def test_catalog_required_when_ambiguous(fake, monkeypatch):
     monkeypatch.setenv("ALLOWED_CATALOGS", "mody_dev,mody_prod")
     with pytest.raises(ValueError, match="wajib diisi"):
-        server.list_schemas()
+        server.list_tables()
 
 
 def test_list_tables_all_schemas_in_one_call(fake):
@@ -876,8 +904,8 @@ def test_tool_schema_budget():
 def test_schema_titles_stripped_but_title_parameter_kept():
     import asyncio
     tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
-    assert "title" in tools["github_create_pr"].inputSchema["properties"]
-    assert tools["github_create_pr"].inputSchema["properties"]["title"].get("type") == "string"
+    title = tools["github_update_pr"].inputSchema["properties"]["title"]
+    assert isinstance(title, dict) and "string" in json.dumps(title)
     assert "title" not in tools["query_table"].inputSchema
     assert "title" not in tools["query_table"].inputSchema["properties"]["full_name"]
     assert "title" not in tools["aggregate_table"].inputSchema["$defs"]["Metric"]
