@@ -27,14 +27,16 @@ from databricks.sdk.service.sql import (
     StatementParameterListItem,
     StatementState,
 )
-from databricks.sdk.errors import DatabricksError, Unauthenticated
+from databricks.sdk.errors import DatabricksError, NotFound, Unauthenticated
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 HOST = os.environ.get("HOST", "127.0.0.1")  # remote: set HOST eksplisit, taruh di belakang proxy TLS
 PORT = int(os.environ.get("PORT", "8000"))
 MAX_CELL = 200
+MAX_CELL_FEW = 800  # hasil sedikit baris: sel (mis. JSON confusion_matrix) boleh lebih panjang
+FEW_ROWS = 10
 OPS = {"=", "!=", "<", "<=", ">", ">=", "IN", "IS NULL", "IS NOT NULL"}
 MAX_IN_VALUES = 100
 MIN_API_KEY_LEN = 32
@@ -59,6 +61,20 @@ def redact(text: str) -> str:
     return text.strip()[:MAX_ERROR_CHARS]
 
 
+NOT_FOUND_HINTS = {
+    **dict.fromkeys(("describe_table", "preview_table", "query_table", "aggregate_table"), "Cek nama tabel dengan list_tables."),
+    "list_tables": "Cek nama catalog/schema dengan list_schemas.",
+    "list_schemas": "Cek nama catalog dengan list_catalogs.",
+    "list_models": "Cek nama schema dengan list_schemas.",
+    "list_model_versions": "Cek nama model dengan list_models.",
+    "search_runs": "Cek path dengan list_experiments.",
+    "get_run": "run_id MLflow berasal dari search_runs.",
+    "list_job_runs": "Cek nama job dengan list_jobs.",
+    "get_job_run": "run_id Job berasal dari list_job_runs.",
+    "get_task_output": "task_run_id berasal dari get_job_run.",
+}
+
+
 def public_error(name: str, e: Exception) -> ToolError | None:
     """Pesan error yang aman dikirim ke agent. None = pesan asli sudah aman (error validasi kita sendiri).
 
@@ -73,13 +89,34 @@ def public_error(name: str, e: Exception) -> ToolError | None:
         detail = "autentikasi Databricks gagal (token tidak valid atau kedaluwarsa), hubungi admin server"
     elif isinstance(cause, DatabricksError):
         detail = redact(str(cause)) or type(cause).__name__
+        if isinstance(cause, NotFound) and name in NOT_FOUND_HINTS:
+            detail += f". {NOT_FOUND_HINTS[name]}"
     else:
         detail = "kesalahan internal server"
     return ToolError(f"Error executing tool {name}: {detail} (error_id: {error_id})")
 
 
+def slim_schema(node: Any) -> Any:
+    """Buang anotasi 'title' otomatis pydantic dari JSON schema (noise ~15% token). Parameter bernama title tetap aman."""
+    if isinstance(node, list):
+        return [slim_schema(n) for n in node]
+    if not isinstance(node, dict):
+        return node
+    return {
+        k: ({n: slim_schema(sub) for n, sub in v.items()} if k in ("properties", "$defs") else slim_schema(v))
+        for k, v in node.items()
+        if not (k == "title" and isinstance(v, str))
+    }
+
+
 class AuditedFastMCP(FastMCP):
     """Satu baris JSON per tool call untuk SIEM. Hanya nama argumen, bukan nilainya (bisa berisi PII/kode)."""
+
+    async def list_tools(self) -> list[Any]:
+        tools = await super().list_tools()
+        for t in tools:
+            t.inputSchema = slim_schema(t.inputSchema)
+        return tools
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         start, outcome, size = time.monotonic(), "ok", None
@@ -121,6 +158,25 @@ def check_catalog(catalog: str) -> None:
         raise ValueError(f"Catalog '{catalog}' tidak diizinkan")
 
 
+MAX_SCHEMAS = 30
+
+
+def resolve_catalog(catalog: str = "") -> str:
+    """catalog kosong = satu-satunya catalog yang diizinkan. Kalau ada lebih dari satu, wajib diisi."""
+    if catalog:
+        check_catalog(catalog)
+        return catalog
+    allowed = sorted(allowed_catalogs())
+    if len(allowed) != 1:
+        raise ValueError(f"catalog wajib diisi. Pilihan: {allowed}")
+    return allowed[0]
+
+
+def schema_names(catalog: str) -> list[str]:
+    names = [s.name for s in ws().schemas.list(catalog_name=catalog) if s.name != "information_schema"]
+    return names[:MAX_SCHEMAS]
+
+
 def split_full_name(full_name: str) -> list[str]:
     parts = full_name.split(".")
     if len(parts) != 3 or not all(parts):
@@ -129,24 +185,30 @@ def split_full_name(full_name: str) -> list[str]:
     return parts
 
 
-def cell(value: Any) -> str:
+def cell(value: Any, limit: int = MAX_CELL) -> str:
     text = "-" if value is None or value == "" else str(value)
     text = text.replace("|", "\\|").replace("\n", " ")
-    return text if len(text) <= MAX_CELL else text[:MAX_CELL] + "..."
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
 def md_table(headers: list[str], rows: list[list[Any]]) -> str:
+    limit = MAX_CELL_FEW if len(rows) <= FEW_ROWS else MAX_CELL
     lines = ["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers)]
-    lines += ["| " + " | ".join(cell(v) for v in row) + " |" for row in rows]
+    lines += ["| " + " | ".join(cell(v, limit) for v in row) + " |" for row in rows]
     return "\n".join(lines)
 
 
-def columns_table(columns: list[Any] | None) -> str:
+def columns_table(columns: list[Any] | None, samples: dict[str, str] | None = None) -> str:
     if not columns:
         return "(kolom tidak tersedia dari Unity Catalog)"
+    if samples is None:
+        return md_table(
+            ["column", "type", "nullable", "comment"],
+            [[c.name, c.type_text, "yes" if c.nullable else "no", c.comment] for c in columns],
+        )
     return md_table(
-        ["column", "type", "nullable", "comment"],
-        [[c.name, c.type_text, "yes" if c.nullable else "no", c.comment] for c in columns],
+        ["column", "type", "nullable", "comment", "contoh_nilai"],
+        [[c.name, c.type_text, "yes" if c.nullable else "no", c.comment, samples.get(c.name)] for c in columns],
     )
 
 
@@ -162,49 +224,78 @@ def list_catalogs() -> str:
 
 
 @mcp.tool()
-def list_schemas(catalog: str) -> str:
-    """Daftar schema di satu catalog, dengan komentarnya."""
-    check_catalog(catalog)
+def list_schemas(catalog: str = "") -> str:
+    """Daftar schema di satu catalog, dengan komentarnya. catalog kosong = catalog tunggal yang diizinkan."""
+    catalog = resolve_catalog(catalog)
     rows = [[s.name, s.comment] for s in ws().schemas.list(catalog_name=catalog)]
     return f"Schema di {catalog} ({len(rows)}):\n" + md_table(["schema", "comment"], rows)
 
 
 @mcp.tool()
-def list_tables(catalog: str, schema: str, include_columns: bool = False) -> str:
-    """Daftar tabel di satu schema. include_columns=True menambahkan kolom tiap tabel (output panjang).
+def list_tables(catalog: str = "", schema: str = "", include_columns: bool = False) -> str:
+    """Daftar tabel. schema kosong = semua schema di catalog (satu panggilan, tanpa list_schemas dulu).
 
-    Biarkan include_columns=False kecuali perlu kolom banyak tabel sekaligus. Untuk satu tabel pakai describe_table.
+    catalog kosong = catalog tunggal yang diizinkan. include_columns=True menambah kolom tiap tabel (output panjang);
+    untuk satu tabel pakai describe_table.
     """
-    check_catalog(catalog)
-    tables = list(ws().tables.list(catalog_name=catalog, schema_name=schema, omit_columns=not include_columns))
-    out = f"Tabel di {catalog}.{schema} ({len(tables)}):\n" + md_table(
-        ["table", "type", "comment"],
-        [[t.name, t.table_type.value if t.table_type else None, t.comment] for t in tables],
-    )
-    if include_columns:
-        out += "".join(f"\n\n### {t.name}\n{columns_table(t.columns)}" for t in tables)
+    catalog = resolve_catalog(catalog)
+    blocks = []
+    for sc in [schema] if schema else schema_names(catalog):
+        tables = list(ws().tables.list(catalog_name=catalog, schema_name=sc, omit_columns=not include_columns))
+        block = f"Tabel di {catalog}.{sc} ({len(tables)}):\n" + md_table(
+            ["table", "type", "comment"],
+            [[t.name, t.table_type.value if t.table_type else None, t.comment] for t in tables],
+        )
+        if include_columns:
+            block += "".join(f"\n\n### {t.name}\n{columns_table(t.columns)}" for t in tables)
+        blocks.append(block)
+    return "\n\n".join(blocks)
+
+
+@mcp.tool()
+def list_models(catalog: str = "", schema: str = "") -> str:
+    """Daftar model terdaftar (Unity Catalog). schema kosong = semua schema. Pakai untuk mencari full_name sebelum list_model_versions."""
+    catalog = resolve_catalog(catalog)
+    rows = []
+    for sc in [schema] if schema else schema_names(catalog):
+        rows += [[m.full_name, m.comment] for m in ws().registered_models.list(catalog_name=catalog, schema_name=sc)]
+    return f"Model di {catalog}{'.' + schema if schema else ''} ({len(rows)}):\n" + md_table(["full_name", "comment"], rows)
+
+
+SAMPLE_DISTINCT = 8
+
+
+def categorical_samples(full_name: str, columns: list[Any]) -> dict[str, str]:
+    """Nilai kolom string berkardinalitas rendah dari satu sampel acak (satu query warehouse)."""
+    names = [c.name for c in columns if (c.type_text or "").lower() == "string"][:30]
+    if not names:
+        return {}
+    sql, params = build_query(full_name, {c.name for c in columns}, columns=names, sample=True, limit=max_rows())
+    _, rows, _ = execute(sql, params)
+    out = {}
+    for i, name in enumerate(names):
+        values = sorted({str(r[i]) for r in rows if r[i] is not None})
+        if 0 < len(values) <= SAMPLE_DISTINCT:
+            out[name] = ", ".join(v[:40] for v in values)
     return out
 
 
 @mcp.tool()
-def list_models(catalog: str, schema: str) -> str:
-    """Daftar model terdaftar (Unity Catalog) di satu schema. Pakai ini untuk mencari full_name model sebelum list_model_versions."""
-    check_catalog(catalog)
-    rows = [[m.full_name, m.comment] for m in ws().registered_models.list(catalog_name=catalog, schema_name=schema)]
-    return f"Model di {catalog}.{schema} ({len(rows)}):\n" + md_table(["full_name", "comment"], rows)
+def describe_table(full_name: str, include_samples: bool = False) -> str:
+    """Struktur satu tabel: tipe, format, owner, komentar, kolom. full_name = catalog.schema.table.
 
-
-@mcp.tool()
-def describe_table(full_name: str) -> str:
-    """Struktur lengkap satu tabel: tipe, format, owner, komentar, dan semua kolom. full_name = catalog.schema.table."""
+    include_samples=True menambah nilai kolom teks berkardinalitas rendah (mis. label kelas) dari sampel acak;
+    memakai warehouse, pakai bila perlu tahu nilai filter yang sah.
+    """
     split_full_name(full_name)
     t = ws().tables.get(full_name=full_name)
+    samples = categorical_samples(full_name, t.columns or []) if include_samples else None
     return (
         f"## {t.full_name}\n"
         f"- type: {cell(t.table_type.value if t.table_type else None)}, "
         f"format: {cell(t.data_source_format.value if t.data_source_format else None)}\n"
         f"- owner: {cell(t.owner)}\n"
-        f"- comment: {cell(t.comment)}\n\n" + columns_table(t.columns)
+        f"- comment: {cell(t.comment)}\n\n" + columns_table(t.columns, samples)
     )
 
 
@@ -212,12 +303,16 @@ def describe_table(full_name: str) -> str:
 
 
 class Filter(BaseModel):
-    column: str = Field(description="Nama kolom, harus ada di tabel (cek describe_table)")
-    op: str = Field(
-        description="Operator, tepat salah satu dari daftar enum",
-        json_schema_extra={"enum": sorted(OPS)},
-    )
-    value: str | int | float | bool | list[str | int | float | bool] | None = None
+    column: str = Field(description="Nama kolom di tabel")
+    op: str = Field(description="Operator", json_schema_extra={"enum": sorted(OPS)})
+    value: str | list[str] | None = Field(default=None, description="Nilai sebagai teks. IN: list. IS NULL: kosong")
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def as_text(cls, v: Any) -> Any:
+        if isinstance(v, (list, tuple)):
+            return [str(i) for i in v]
+        return v if v is None or isinstance(v, str) else str(v)
 
 
 def where_clause(filters: list[Filter] | None, ident: Any, params: dict[str, str]) -> str:
@@ -253,6 +348,7 @@ def build_query(
     order_by: str | None = None,
     desc: bool = False,
     limit: int = 20,
+    sample: bool = False,
 ) -> tuple[str, dict[str, str]]:
     """Susun SELECT bertemplate. Semua nama dan nilai dari agent jadi parameter marker, tidak pernah ditempel ke SQL."""
     params: dict[str, str] = {"tbl": full_name}
@@ -268,14 +364,18 @@ def build_query(
 
     sql += where_clause(filters, ident, params)
 
-    if order_by:
+    if sample:
+        if order_by:
+            raise ValueError("sample tidak bisa digabung dengan order_by")
+        sql += " ORDER BY RAND()"
+    elif order_by:
         sql += f" ORDER BY {ident(order_by, 'o')}" + (" DESC" if desc else "")
 
     sql += f" LIMIT {clamp(limit)}"
     return sql, params
 
 
-def run_query(sql: str, params: dict[str, str]) -> str:
+def execute(sql: str, params: dict[str, str]) -> tuple[list[str], list[list[Any]], bool]:
     warehouse_id = os.environ.get("DATABRICKS_SQL_WAREHOUSE_ID")
     if not warehouse_id:
         raise ValueError("DATABRICKS_SQL_WAREHOUSE_ID belum diset di server")
@@ -295,20 +395,48 @@ def run_query(sql: str, params: dict[str, str]) -> str:
         raise RuntimeError(f"Query {state.value if state else 'UNKNOWN'}: {error}")
     headers = [c.name for c in resp.manifest.schema.columns]
     rows = (resp.result.data_array if resp.result else None) or []
+    return headers, rows, bool(getattr(resp.manifest, "truncated", False))
+
+
+def run_query(sql: str, params: dict[str, str]) -> str:
+    headers, rows, truncated = execute(sql, params)
     note = ""
     if not rows:
         note = (" - kosong. Cek nilai filter: kolom kategori biasanya berisi teks (mis. 'padi'), bukan angka. "
                 "Lihat nilai asli dengan preview_table")
-    elif len(rows) >= max_rows() or getattr(resp.manifest, "truncated", False):
+    elif len(rows) >= max_rows() or truncated:
         note = f" - mencapai batas MAX_ROWS={max_rows()}, hasil mungkin terpotong. Pakai aggregate_table atau filter lebih sempit"
     return f"{len(rows)} baris{note}\n" + md_table(headers, rows)
 
 
-def query(full_name: str, **kwargs: Any) -> str:
+COLUMN_TTL = 300
+COLUMN_CACHE: dict[str, tuple[float, set[str]]] = {}
+
+
+def table_columns(full_name: str, refresh: bool = False) -> set[str]:
+    """Nama kolom tabel untuk validasi. Di-cache beberapa menit supaya tiap query tidak memanggil tables.get."""
+    hit = COLUMN_CACHE.get(full_name)
+    if hit and not refresh and time.monotonic() - hit[0] < COLUMN_TTL:
+        return hit[1]
+    columns = {c.name for c in ws().tables.get(full_name=full_name).columns or []}
+    COLUMN_CACHE[full_name] = (time.monotonic(), columns)
+    return columns
+
+
+def with_columns(full_name: str, build: Any) -> str:
+    """Jalankan query dengan validasi kolom. Kalau kolom tidak dikenal dan daftar berasal dari cache, ambil ulang sekali."""
     split_full_name(full_name)
-    table = ws().tables.get(full_name=full_name)
-    known = {c.name for c in table.columns or []}
-    return run_query(*build_query(full_name, known, **kwargs))
+    cached = full_name in COLUMN_CACHE
+    try:
+        return run_query(*build(table_columns(full_name)))
+    except ValueError as e:
+        if cached and "tidak ada" in str(e):
+            return run_query(*build(table_columns(full_name, refresh=True)))
+        raise
+
+
+def query(full_name: str, **kwargs: Any) -> str:
+    return with_columns(full_name, lambda known: build_query(full_name, known, **kwargs))
 
 
 @mcp.tool()
@@ -323,35 +451,30 @@ def preview_table(full_name: str, limit: int = 20) -> str:
 @mcp.tool()
 def query_table(
     full_name: str,
-    columns: list[str] | None = None,
-    filters: list[Filter] | None = None,
-    order_by: str | None = None,
+    columns: list[str] = [],  # noqa: B006
+    filters: list[Filter] = [],  # noqa: B006
+    order_by: str = "",
     desc: bool = False,
     limit: int = 20,
+    sample: bool = False,
 ) -> str:
-    """Ambil baris tertentu dari satu tabel, read-only.
+    """Ambil baris mentah satu tabel (read-only). Untuk hitungan, rata-rata, distribusi pakai aggregate_table.
 
-    columns: kolom yang diambil, kosong = semua.
-    filters: digabung AND. op salah satu =, !=, <, <=, >, >=, IN, IS NULL, IS NOT NULL.
-      Contoh: [{"column": "scope", "op": "=", "value": "production"},
-               {"column": "pred_class", "op": "IN", "value": ["padi", "jagung"]}]
-    order_by + desc: urutan. limit dibatasi MAX_ROWS server.
-    Untuk hitungan, rata-rata, distribusi, atau perbandingan antar kelas pakai aggregate_table, jangan sampling baris.
-    Pakai describe_table dulu untuk tahu nama kolom yang sah.
+    columns: kosong = semua. filters: digabung AND, mis. [{"column": "scope", "op": "=", "value": "production"}]; IN pakai list.
+    order_by + desc: urutan. sample=True: sampel acak (tanpa order_by). limit dibatasi MAX_ROWS.
     """
-    return query(full_name, columns=columns, filters=filters, order_by=order_by, desc=desc, limit=limit)
+    return query(full_name, columns=columns, filters=filters, order_by=order_by, desc=desc, limit=limit, sample=sample)
 
 
 MAX_GROUP_BY = 5
 MAX_METRICS = 10
-AGG_FUNCS = {"count": "COUNT", "count_distinct": "COUNT", "avg": "AVG", "min": "MIN", "max": "MAX", "sum": "SUM"}
+AGG_FUNCS = {"count": "COUNT", "count_distinct": "COUNT", "avg": "AVG", "min": "MIN", "max": "MAX", "sum": "SUM",
+             "stddev": "STDDEV", "median": "MEDIAN"}
 
 
 class Metric(BaseModel):
-    fn: Literal["count", "count_distinct", "avg", "min", "max", "sum"] = Field(
-        description="Fungsi agregat. count tanpa column = jumlah baris"
-    )
-    column: str | None = Field(default=None, description="Kolom yang diagregasi. Kosong hanya untuk count")
+    fn: Literal["count", "count_distinct", "avg", "min", "max", "sum", "stddev", "median"]
+    column: str = Field(default="", description="Kolom yang diagregasi. Kosong hanya untuk count")
 
 
 def build_aggregate(
@@ -379,7 +502,7 @@ def build_aggregate(
     select = [ident(c, f"g{i}") for i, c in enumerate(group_by)]
     aliases: list[str] = []
     for i, m in enumerate(metrics):
-        if m.column is None:
+        if not m.column:
             if m.fn != "count":
                 raise ValueError(f"fn '{m.fn}' butuh column")
             expr, alias = "COUNT(*)", "n"
@@ -411,25 +534,21 @@ def build_aggregate(
 def aggregate_table(
     full_name: str,
     metrics: list[Metric],
-    group_by: list[str] | None = None,
-    filters: list[Filter] | None = None,
-    order_by: str | None = None,
+    group_by: list[str] = [],  # noqa: B006
+    filters: list[Filter] = [],  # noqa: B006
+    order_by: str = "",
     desc: bool = True,
     limit: int = 50,
 ) -> str:
-    """Hitung agregat (jumlah, rata-rata, min, max, sum) satu tabel, opsional per kelompok. Read-only.
+    """Agregat satu tabel, opsional per kelompok (read-only). Pakai ini, bukan query_table, untuk statistik,
+    distribusi, perbandingan antar kelas, dan confusion matrix.
 
-    Pakai ini, BUKAN query_table, untuk statistik, perbandingan antar kelas, distribusi, atau confusion matrix:
-    satu panggilan menggantikan banyak sampel baris. Pakai query_table kalau butuh baris mentah.
-    metrics: [{"fn": "count"}, {"fn": "avg", "column": "ndvi"}]. Nama hasil: n, avg_ndvi, dst.
-    group_by: kolom pengelompokan, misalnya ["truth_class", "pred_class"] untuk confusion matrix.
-    filters: sama seperti query_table. order_by: nama hasil metrik atau kolom group_by, default metrik pertama.
-    Pakai describe_table dulu untuk tahu nama kolom yang sah.
+    metrics: [{"fn": "count"}, {"fn": "avg", "column": "ndvi"}] -> kolom n, avg_ndvi. fn: count, count_distinct, avg, min, max, sum, stddev, median.
+    group_by: mis. ["truth_class", "pred_class"]. filters: seperti query_table. order_by: nama hasil atau kolom group_by.
     """
-    split_full_name(full_name)
-    table = ws().tables.get(full_name=full_name)
-    known = {c.name for c in table.columns or []}
-    return run_query(*build_aggregate(full_name, known, metrics, group_by, filters, order_by, desc, limit))
+    return with_columns(
+        full_name, lambda known: build_aggregate(full_name, known, metrics, group_by, filters, order_by, desc, limit)
+    )
 
 
 # ---------- helper ----------
@@ -452,6 +571,7 @@ def clamp(limit: int) -> int:
 
 # ---------- mlflow ----------
 
+MAX_METRIC_NAMES = 40
 RUN_TAGS = ("track", "model_version_label", "git_branch", "git_commit")
 
 
@@ -468,7 +588,7 @@ def check_experiment(name: str) -> None:
     prefix = normalize_experiment(experiment_prefix())
     path = normalize_experiment(name)
     if prefix and (not path.startswith(prefix) or ".." in path.split("/")):
-        raise ValueError(f"Experiment '{name}' tidak diizinkan. Harus berawalan '{prefix}'")
+        raise ValueError(f"Experiment '{name}' tidak diizinkan. Harus berawalan '{prefix}'. Lihat daftar dengan list_experiments")
 
 
 @mcp.tool()
@@ -492,15 +612,14 @@ def search_runs(
     experiment_path: str,
     filter: str = "",
     order_by: str = "",
-    metrics: list[str] | None = None,
+    metrics: list[str] = [],  # noqa: B006
     limit: int = 10,
 ) -> str:
-    """Daftar run MLflow (eksperimen ML, bukan Job Databricks) di satu experiment, terbaru dulu.
+    """Daftar run MLflow (bukan Job Databricks) di satu experiment, terbaru dulu. Path dari list_experiments.
 
-    experiment_path: misalnya /Workspace/Shared/mody/geo_commodity_classification.
-    filter: sintaks MLflow, misalnya "tags.git_branch = 'agent/x'" atau "metrics.macro_f1 > 0.7".
-    order_by: misalnya "metrics.macro_f1 DESC". Kosong = start_time terbaru.
-    metrics: metrik yang ditampilkan, kosong = semua (dipotong kalau panjang).
+    filter: sintaks MLflow, mis. "tags.git_branch = 'agent/x'" atau "metrics.macro_f1 > 0.7".
+    order_by: mis. "metrics.macro_f1 DESC". Untuk mencari run terbaik: order_by metrik + limit kecil
+    (nama metrik ada di baris "metrik tersedia"). metrics: metrik yang ditampilkan, kosong = semua.
     """
     check_experiment(experiment_path)
     experiment = ws().experiments.get_by_name(normalize_experiment(experiment_path)).experiment
@@ -513,19 +632,21 @@ def search_runs(
         ),
         clamp(limit),
     )
-    rows = []
+    rows, available = [], set()
     for r in runs:
         tags = {t.key: t.value for t in r.data.tags or []}
         values = {m.key: m.value for m in r.data.metrics or []}
+        available.update(values)
         shown = metrics or sorted(values)
         rows.append([
             r.info.run_id, r.info.run_name, r.info.status.value if r.info.status else None, ts(r.info.start_time),
             *(tags.get(k) for k in RUN_TAGS),
             ", ".join(f"{k}={values[k]:.4g}" for k in shown if k in values),
         ])
-    return f"{len(rows)} run di {experiment.name}\n" + md_table(
-        ["run_id", "run_name", "status", "start", *RUN_TAGS, "metrics"], rows
-    )
+    head = f"{len(rows)} run di {experiment.name}"
+    if available:
+        head += f"\nmetrik tersedia: {', '.join(sorted(available)[:MAX_METRIC_NAMES])}"
+    return head + "\n" + md_table(["run_id", "run_name", "status", "start", *RUN_TAGS, "metrics"], rows)
 
 
 @mcp.tool()
@@ -548,11 +669,35 @@ def get_run(run_id: str) -> str:
     )
 
 
-@mcp.tool()
-def list_model_versions(full_name: str, limit: int = 20) -> str:
-    """Versi model Unity Catalog beserta alias (misalnya champion), terbaru dulu. full_name = catalog.schema.model.
+MAX_VERSIONS_WITH_METRICS = 10
 
-    run_id tiap versi bisa dipakai di get_run untuk melihat metrik versi tersebut.
+
+def run_metrics(run_id: str | None, wanted: list[str], allowed: dict[str, bool]) -> str:
+    """Metrik satu run, hanya bila experiment-nya diizinkan. allowed = cache hasil cek per experiment."""
+    if not run_id:
+        return "-"
+    try:
+        run = ws().experiments.get_run(run_id).run
+        eid = run.info.experiment_id
+        if eid not in allowed:
+            try:
+                check_experiment(ws().experiments.get_experiment(eid).experiment.name)
+                allowed[eid] = True
+            except ValueError:
+                allowed[eid] = False
+    except DatabricksError:
+        return "(run tidak tersedia)"
+    if not allowed[eid]:
+        return "(di luar experiment yang diizinkan)"
+    values = {m.key: m.value for m in run.data.metrics or []}
+    return ", ".join(f"{k}={values[k]:.4g}" for k in wanted if k in values) or "-"
+
+
+@mcp.tool()
+def list_model_versions(full_name: str, limit: int = 20, metrics: list[str] = []) -> str:  # noqa: B006
+    """Versi model Unity Catalog beserta alias (mis. champion), terbaru dulu. full_name = catalog.schema.model.
+
+    metrics: nama metrik run tiap versi yang ingin ditampilkan langsung (maksimal 10 versi), tanpa get_run satu per satu.
     """
     split_full_name(full_name)
     model = ws().registered_models.get(full_name, include_aliases=True)
@@ -560,13 +705,16 @@ def list_model_versions(full_name: str, limit: int = 20) -> str:
     for a in model.aliases or []:
         aliases.setdefault(int(a.version_num), []).append(a.alias_name)
     versions = sorted(ws().model_versions.list(full_name), key=lambda v: int(v.version), reverse=True)
+    versions = versions[: min(clamp(limit), MAX_VERSIONS_WITH_METRICS) if metrics else clamp(limit)]
+    allowed: dict[str, bool] = {}
     rows = [
         [v.version, ", ".join(aliases.get(int(v.version), [])), v.run_id,
-         v.status.value if v.status else None, ts(v.created_at), v.comment]
-        for v in versions[: clamp(limit)]
+         v.status.value if v.status else None, ts(v.created_at), v.comment,
+         *([run_metrics(v.run_id, metrics, allowed)] if metrics else [])]
+        for v in versions
     ]
     return f"{len(rows)} versi {full_name}\n" + md_table(
-        ["version", "aliases", "run_id", "status", "created", "comment"], rows
+        ["version", "aliases", "run_id", "status", "created", "comment", *(["metrics"] if metrics else [])], rows
     )
 
 
@@ -637,7 +785,7 @@ def list_job_runs(job_name: str, limit: int = 10) -> str:
     check_job_name(job_name)
     job = next(iter(ws().jobs.list(name=job_name)), None)
     if job is None:
-        raise ValueError(f"Job '{job_name}' tidak ditemukan")
+        raise ValueError(f"Job '{job_name}' tidak ditemukan. Lihat daftar dengan list_jobs")
     runs = islice(ws().jobs.list_runs(job_id=job.job_id, limit=min(clamp(limit), 25)), clamp(limit))
     rows = [
         [r.run_id, run_state(r.state), ts(r.start_time), duration(r.start_time, r.end_time),

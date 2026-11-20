@@ -17,6 +17,7 @@ TBL = "mody_dev.geo_commodity_classification.inference_log"
 def env(monkeypatch):
     monkeypatch.setenv("ALLOWED_CATALOGS", "mody_dev")
     monkeypatch.setenv("MAX_ROWS", "100")
+    server.COLUMN_CACHE.clear()
 
 
 class FakeWs:
@@ -32,7 +33,7 @@ class FakeWs:
             self.sent = kw
             return NS(status=NS(state=server.StatementState.SUCCEEDED, error=None),
                       manifest=NS(schema=NS(columns=[NS(name="scope")])),
-                      result=NS(data_array=[["production"], ["a|b\nc" + "x" * 300]]))
+                      result=NS(data_array=[["production"], ["a|b\nc" + "x" * 900]]))
 
         self.statement_execution = NS(execute_statement=execute_statement)
 
@@ -595,7 +596,7 @@ def test_aggregate_rejects_bad_input(kwargs, msg):
 
 def test_aggregate_invalid_fn_rejected_by_schema():
     with pytest.raises(Exception):  # noqa: B017
-        server.Metric(fn="median", column="scope")
+        server.Metric(fn="mode", column="scope")
 
 
 def test_aggregate_table_runs(fake):
@@ -730,3 +731,153 @@ def test_audit_outcome_records_real_cause(fake, caplog):
     call_error("list_catalogs", {})
     rec = json.loads([r for r in caplog.records if r.name == "mody_mcp.audit"][-1].getMessage())
     assert rec["outcome"] == "Unauthenticated"
+
+
+# ---------- optimasi A/B/C: discovery, sampling, cache, skema ----------
+
+
+def test_single_allowed_catalog_is_default(fake):
+    fake.schemas = NS(list=lambda catalog_name: [NS(name="core", comment=None)])
+    assert "Schema di mody_dev (1)" in server.list_schemas()
+
+
+def test_catalog_required_when_ambiguous(fake, monkeypatch):
+    monkeypatch.setenv("ALLOWED_CATALOGS", "mody_dev,mody_prod")
+    with pytest.raises(ValueError, match="wajib diisi"):
+        server.list_schemas()
+
+
+def test_list_tables_all_schemas_in_one_call(fake):
+    fake.schemas = NS(list=lambda catalog_name: [NS(name="core"), NS(name="information_schema"), NS(name="geo")])
+    seen = []
+
+    def tables(catalog_name, schema_name, omit_columns):
+        seen.append(schema_name)
+        return [NS(name=f"t_{schema_name}", table_type=None, comment=None)]
+
+    fake.tables = NS(list=tables)
+    out = server.list_tables()
+    assert seen == ["core", "geo"] and "t_core" in out and "t_geo" in out and "information_schema" not in out
+
+
+def test_list_tables_single_schema_still_works(fake):
+    fake.tables = NS(list=lambda catalog_name, schema_name, omit_columns: [NS(name="t", table_type=None, comment=None)])
+    out = server.list_tables("mody_dev", "core")
+    assert out.startswith("Tabel di mody_dev.core (1)")
+
+
+def test_list_models_all_schemas(fake):
+    fake.schemas = NS(list=lambda catalog_name: [NS(name="a"), NS(name="b")])
+    fake.registered_models = NS(list=lambda catalog_name, schema_name: [NS(full_name=f"mody_dev.{schema_name}.m", comment=None)])
+    out = server.list_models()
+    assert "mody_dev.a.m" in out and "mody_dev.b.m" in out
+
+
+def test_aggregate_stddev_and_median():
+    sql, _ = server.build_aggregate(
+        TBL, COLS, metrics=[server.Metric(fn="stddev", column="period"), server.Metric(fn="median", column="period")],
+        group_by=["scope"])
+    assert "STDDEV(IDENTIFIER(:m0)) AS `stddev_period`" in sql and "MEDIAN(IDENTIFIER(:m1)) AS `median_period`" in sql
+
+
+def test_sample_orders_randomly_and_rejects_order_by():
+    sql, _ = build_query(TBL, COLS, sample=True, limit=5)
+    assert sql.endswith("ORDER BY RAND() LIMIT 5")
+    with pytest.raises(ValueError, match="sample"):
+        build_query(TBL, COLS, sample=True, order_by="scope")
+
+
+def test_query_table_sample_runs(fake):
+    server.query_table(TBL, sample=True)
+    assert "ORDER BY RAND()" in fake.sent["statement"]
+
+
+def test_not_found_hint(fake):
+    from databricks.sdk.errors import NotFound
+
+    def boom(**kw):
+        raise NotFound("Table 'x' does not exist")
+
+    fake.tables = NS(get=boom)
+    msg = call_error("describe_table", {"full_name": TBL})
+    assert "does not exist" in msg and "list_tables" in msg
+
+
+def test_columns_cached_between_queries(fake):
+    calls = []
+    original = fake.tables.get
+    fake.tables = NS(get=lambda full_name: calls.append(1) or original(full_name=full_name))
+    server.query_table(TBL)
+    server.query_table(TBL)
+    server.aggregate_table(TBL, metrics=[server.Metric(fn="count")])
+    assert len(calls) == 1
+
+
+def test_stale_cache_refreshed_once_on_unknown_column(fake):
+    server.COLUMN_CACHE[TBL] = (server.time.monotonic(), {"lama"})
+    out = server.query_table(TBL, columns=["scope"])
+    assert out.startswith("2 baris")
+    assert server.COLUMN_CACHE[TBL][1] == {"scope"}
+
+
+def test_unknown_column_still_rejected_after_refresh(fake):
+    server.query_table(TBL)
+    with pytest.raises(ValueError, match="tidak ada"):
+        server.query_table(TBL, columns=["nope"])
+
+
+def test_describe_table_samples(fake):
+    out = server.describe_table(TBL, include_samples=True)
+    assert "contoh_nilai" in out and "production" in out
+    assert "contoh_nilai" not in server.describe_table(TBL)
+
+
+def test_filter_value_coerced_to_text():
+    assert Filter(column="a", op="=", value=2).value == "2"
+    assert Filter(column="a", op="IN", value=[1, "x"]).value == ["1", "x"]
+    assert Filter(column="a", op="IS NULL").value is None
+    schema = json.dumps(Filter.model_json_schema())
+    assert "integer" not in schema and "boolean" not in schema
+
+
+def test_few_rows_keep_long_cells(fake):
+    long = server.md_table(["a"], [["y" * 700]])
+    assert "..." not in long
+    many = server.md_table(["a"], [["y" * 700]] * 11)
+    assert "..." in many
+
+
+def test_search_runs_lists_available_metrics(mlflow_fake):
+    out = server.search_runs(EXP)
+    assert out.splitlines()[1] == "metrik tersedia: accuracy, macro_f1"
+    assert "order_by" in server.search_runs.__doc__
+
+
+def test_model_versions_with_metrics(mlflow_fake):
+    out = server.list_model_versions("mody_dev.core.m", metrics=["accuracy"])
+    assert "accuracy=0.8" in out and "| metrics |" in out
+    assert "metrics |" not in server.list_model_versions("mody_dev.core.m")
+
+
+def test_model_versions_metrics_skip_foreign_experiment(mlflow_fake):
+    mlflow_fake.model_versions = NS(list=lambda name: iter([
+        NS(version="1", run_id="foreign", status=NS(value="READY"), created_at=T0, comment=None)]))
+    out = server.list_model_versions("mody_dev.core.m", metrics=["accuracy"])
+    assert "di luar experiment" in out and "accuracy=" not in out
+
+
+def test_tool_schema_budget():
+    import asyncio
+    tools = asyncio.run(server.mcp.list_tools())
+    total = sum(len(json.dumps({"n": t.name, "d": t.description, "p": t.inputSchema})) for t in tools)
+    assert total < 11500, total
+
+
+def test_schema_titles_stripped_but_title_parameter_kept():
+    import asyncio
+    tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
+    assert "title" in tools["github_create_pr"].inputSchema["properties"]
+    assert tools["github_create_pr"].inputSchema["properties"]["title"].get("type") == "string"
+    assert "title" not in tools["query_table"].inputSchema
+    assert "title" not in tools["query_table"].inputSchema["properties"]["full_name"]
+    assert "title" not in tools["aggregate_table"].inputSchema["$defs"]["Metric"]

@@ -6,17 +6,17 @@ Spesifikasi lengkap ada di `docs/2026-10-30-mody-mcp-generik-design.md`.
 | Tool | Isi | Warehouse |
 |---|---|---|
 | `list_catalogs()` | Daftar catalog | tidak |
-| `list_schemas(catalog)` | Daftar schema | tidak |
-| `list_tables(catalog, schema, include_columns=False)` | Daftar tabel, opsional dengan kolom | tidak |
-| `list_models(catalog, schema)` | Daftar model terdaftar UC | tidak |
-| `describe_table(full_name)` | Kolom, tipe, komentar | tidak |
+| `list_schemas(catalog?)` | Daftar schema. `catalog` kosong = catalog tunggal yang diizinkan | tidak |
+| `list_tables(catalog?, schema?, include_columns=False)` | Daftar tabel. `schema` kosong = semua schema | tidak |
+| `list_models(catalog?, schema?)` | Daftar model terdaftar UC | tidak |
+| `describe_table(full_name, include_samples=False)` | Kolom, tipe, komentar; opsional nilai contoh kolom teks | opsional |
 | `preview_table(full_name, limit=20)` | Contoh baris | ya |
-| `query_table(full_name, columns, filters, order_by, desc, limit)` | Baris yang disaring | ya |
-| `aggregate_table(full_name, metrics, group_by, filters, order_by, desc, limit)` | Agregat (count/avg/min/max/sum) per kelompok | ya |
+| `query_table(full_name, columns, filters, order_by, desc, limit, sample)` | Baris yang disaring, `sample=True` untuk sampel acak | ya |
+| `aggregate_table(full_name, metrics, group_by, filters, order_by, desc, limit)` | Agregat (count/count_distinct/avg/min/max/sum/stddev/median) per kelompok | ya |
 | `list_experiments(limit)` | Daftar experiment MLflow yang diizinkan | tidak |
 | `search_runs(experiment_path, filter, order_by, metrics, limit)` | Run MLflow, tag git, dan metrik | tidak |
 | `get_run(run_id)` | Params, metrics, tags satu run | tidak |
-| `list_model_versions(full_name, limit)` | Versi model UC dan alias (`champion`) | tidak |
+| `list_model_versions(full_name, limit, metrics)` | Versi model UC dan alias (`champion`), opsional metrik run | tidak |
 | `list_jobs(limit)` | Daftar job yang diizinkan | tidak |
 | `list_job_runs(job_name, limit)` | Run terakhir satu job | tidak |
 | `get_job_run(run_id)` | Status run dan tiap task | tidak |
