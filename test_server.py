@@ -870,7 +870,7 @@ def test_tool_schema_budget():
     import asyncio
     tools = asyncio.run(server.mcp.list_tools())
     total = sum(len(json.dumps({"n": t.name, "d": t.description, "p": t.inputSchema})) for t in tools)
-    assert total < 11500, total
+    assert total < 11700, total
 
 
 def test_schema_titles_stripped_but_title_parameter_kept():
@@ -897,3 +897,32 @@ def test_not_found_hint_no_double_period(fake):
 def test_model_versions_metrics_missing_lists_available(mlflow_fake):
     out = server.list_model_versions("mody_dev.core.m", metrics=["tidak_ada"])
     assert "tidak ada tidak_ada; tersedia: accuracy, macro_f1" in out
+
+
+def test_search_runs_without_path_searches_all_allowed_experiments(mlflow_fake):
+    seen = {}
+    mlflow_fake.experiments.search_experiments = lambda filter=None, order_by=None, max_results=None: [
+        NS(experiment_id="1", name=EXP, last_update_time=0), NS(experiment_id="9", name="/Shared/other/x", last_update_time=0)]
+    original = mlflow_fake.experiments.search_runs
+
+    def search_runs(**kw):
+        seen.update(kw)
+        return original(**kw)
+
+    mlflow_fake.experiments.search_runs = search_runs
+    out = server.search_runs(order_by="metrics.accuracy DESC", limit=2)
+    assert seen["experiment_ids"] == ["1"]  # experiment di luar awalan tidak ikut
+    lines = out.splitlines()
+    assert lines[0] == "2 run di 1 experiment" and lines[1].startswith("metrik tersedia")
+    assert lines[2].startswith("| experiment | run_id") and EXP in lines[4]
+
+
+def test_search_runs_with_path_unchanged(mlflow_fake):
+    out = server.search_runs(EXP)
+    assert out.splitlines()[2].startswith("| run_id |")
+
+
+def test_search_runs_without_path_and_no_experiments(mlflow_fake):
+    mlflow_fake.experiments.search_experiments = lambda **kw: []
+    with pytest.raises(ValueError, match="Tidak ada experiment"):
+        server.search_runs()

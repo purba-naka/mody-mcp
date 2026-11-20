@@ -591,41 +591,57 @@ def check_experiment(name: str) -> None:
         raise ValueError(f"Experiment '{name}' tidak diizinkan. Harus berawalan '{prefix}'. Lihat daftar dengan list_experiments")
 
 
+MAX_SEARCH_EXPERIMENTS = 20
+
+
+def allowed_experiments(limit: int) -> list[Any]:
+    """Experiment dengan awalan yang diizinkan, terbaru diubah dulu. Filter di server Databricks, startswith jadi pengaman."""
+    prefix = normalize_experiment(experiment_prefix())
+    pattern = prefix.replace("'", "''") + "%"
+    found = ws().experiments.search_experiments(
+        filter=f"name LIKE '{pattern}'", order_by=["last_update_time DESC"], max_results=min(limit * 2, 3000)
+    )
+    return list(islice((e for e in found if normalize_experiment(e.name or "").startswith(prefix)), limit))
+
+
 @mcp.tool()
 def list_experiments(limit: int = 50) -> str:
     """Daftar experiment MLflow yang boleh diakses (awalan ALLOWED_EXPERIMENT_PREFIX).
 
     Pakai ini untuk mencari experiment_path sebelum search_runs. Jangan menebak path.
     """
-    prefix = normalize_experiment(experiment_prefix())
-    pattern = prefix.replace("'", "''") + "%"  # filter di server Databricks; startswith di bawah tetap jadi pengaman
-    found = ws().experiments.search_experiments(
-        filter=f"name LIKE '{pattern}'", order_by=["last_update_time DESC"], max_results=min(clamp(limit) * 2, 3000)
-    )
-    rows = [[e.name, ts(e.last_update_time)]
-            for e in islice((e for e in found if normalize_experiment(e.name or "").startswith(prefix)), clamp(limit))]
+    found = allowed_experiments(clamp(limit))
+    rows = [[e.name, ts(e.last_update_time)] for e in found]
     return f"{len(rows)} experiment\n" + md_table(["experiment_path", "last_update"], rows)
 
 
 @mcp.tool()
 def search_runs(
-    experiment_path: str,
+    experiment_path: str = "",
     filter: str = "",
     order_by: str = "",
     metrics: list[str] = [],  # noqa: B006
     limit: int = 10,
 ) -> str:
-    """Daftar run MLflow (bukan Job Databricks) di satu experiment, terbaru dulu. Path dari list_experiments.
+    """Daftar run MLflow (bukan Job Databricks), terbaru dulu.
 
+    experiment_path kosong = cari di semua experiment yang diizinkan sekaligus (tidak perlu list_experiments dulu).
     filter: sintaks MLflow, mis. "tags.git_branch = 'agent/x'" atau "metrics.macro_f1 > 0.7".
     order_by: mis. "metrics.macro_f1 DESC". Untuk mencari run terbaik: order_by metrik + limit kecil
     (nama metrik ada di baris "metrik tersedia"). metrics: metrik yang ditampilkan, kosong = semua.
     """
-    check_experiment(experiment_path)
-    experiment = ws().experiments.get_by_name(normalize_experiment(experiment_path)).experiment
+    if experiment_path:
+        check_experiment(experiment_path)
+        experiments = [ws().experiments.get_by_name(normalize_experiment(experiment_path)).experiment]
+    else:
+        experiments = allowed_experiments(MAX_SEARCH_EXPERIMENTS)
+        if not experiments:
+            raise ValueError("Tidak ada experiment yang diizinkan")
+    multi = not experiment_path
+    names = {e.experiment_id: e.name for e in experiments}
     runs = islice(
         ws().experiments.search_runs(
-            experiment_ids=[experiment.experiment_id],
+            experiment_ids=[e.experiment_id for e in experiments],
             filter=filter or None,
             order_by=[order_by] if order_by else None,
             max_results=clamp(limit),
@@ -639,14 +655,17 @@ def search_runs(
         available.update(values)
         shown = metrics or sorted(values)
         rows.append([
+            *([names.get(r.info.experiment_id)] if multi else []),
             r.info.run_id, r.info.run_name, r.info.status.value if r.info.status else None, ts(r.info.start_time),
             *(tags.get(k) for k in RUN_TAGS),
             ", ".join(f"{k}={values[k]:.4g}" for k in shown if k in values),
         ])
-    head = f"{len(rows)} run di {experiment.name}"
+    head = f"{len(rows)} run di " + (f"{len(experiments)} experiment" if multi else experiments[0].name)
     if available:
         head += f"\nmetrik tersedia: {', '.join(sorted(available)[:MAX_METRIC_NAMES])}"
-    return head + "\n" + md_table(["run_id", "run_name", "status", "start", *RUN_TAGS, "metrics"], rows)
+    return head + "\n" + md_table(
+        [*(["experiment"] if multi else []), "run_id", "run_name", "status", "start", *RUN_TAGS, "metrics"], rows
+    )
 
 
 @mcp.tool()
