@@ -90,7 +90,7 @@ def public_error(name: str, e: Exception) -> ToolError | None:
     elif isinstance(cause, DatabricksError):
         detail = redact(str(cause)) or type(cause).__name__
         if isinstance(cause, NotFound) and name in NOT_FOUND_HINTS:
-            detail += f". {NOT_FOUND_HINTS[name]}"
+            detail = f"{detail.rstrip('. ')}. {NOT_FOUND_HINTS[name]}"
     else:
         detail = "kesalahan internal server"
     return ToolError(f"Error executing tool {name}: {detail} (error_id: {error_id})")
@@ -690,7 +690,8 @@ def run_metrics(run_id: str | None, wanted: list[str], allowed: dict[str, bool])
     if not allowed[eid]:
         return "(di luar experiment yang diizinkan)"
     values = {m.key: m.value for m in run.data.metrics or []}
-    return ", ".join(f"{k}={values[k]:.4g}" for k in wanted if k in values) or "-"
+    shown = ", ".join(f"{k}={values[k]:.4g}" for k in wanted if k in values)
+    return shown or f"(tidak ada {'/'.join(wanted)}; tersedia: {', '.join(sorted(values)[:8]) or '-'})"
 
 
 @mcp.tool()

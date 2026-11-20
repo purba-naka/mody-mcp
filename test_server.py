@@ -881,3 +881,19 @@ def test_schema_titles_stripped_but_title_parameter_kept():
     assert "title" not in tools["query_table"].inputSchema
     assert "title" not in tools["query_table"].inputSchema["properties"]["full_name"]
     assert "title" not in tools["aggregate_table"].inputSchema["$defs"]["Metric"]
+
+
+def test_not_found_hint_no_double_period(fake):
+    from databricks.sdk.errors import NotFound
+
+    def boom(**kw):
+        raise NotFound("Table 'x' does not exist.")
+
+    fake.tables = NS(get=boom)
+    msg = call_error("describe_table", {"full_name": TBL})
+    assert ".." not in msg and "does not exist. Cek nama tabel" in msg
+
+
+def test_model_versions_metrics_missing_lists_available(mlflow_fake):
+    out = server.list_model_versions("mody_dev.core.m", metrics=["tidak_ada"])
+    assert "tidak ada tidak_ada; tersedia: accuracy, macro_f1" in out
