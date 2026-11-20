@@ -27,7 +27,9 @@ from databricks.sdk.service.sql import (
     StatementParameterListItem,
     StatementState,
 )
+from databricks.sdk.errors import DatabricksError, Unauthenticated
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
 
 HOST = os.environ.get("HOST", "127.0.0.1")  # remote: set HOST eksplisit, taruh di belakang proxy TLS
@@ -38,6 +40,42 @@ MAX_IN_VALUES = 100
 MIN_API_KEY_LEN = 32
 
 audit = logging.getLogger("mody_mcp.audit")
+log = logging.getLogger("mody_mcp")
+
+MAX_ERROR_CHARS = 300
+REDACTIONS = (
+    (re.compile(r"\s*\[ReqId:[^\]]*\]\.?"), ""),
+    (re.compile(r"\s*Config:.*", re.S), ""),
+    (re.compile(r"https?://\S+"), "<url>"),
+    (re.compile(r"[\w.-]+\.(?:databricks|azuredatabricks)\.(?:com|net)"), "<host>"),
+    (re.compile(r"\b(?:workspace|account)_id=\S+"), ""),
+)
+
+
+def redact(text: str) -> str:
+    """Buang host, id workspace/akun, URL, dan request id dari pesan error sebelum sampai ke LLM."""
+    for pattern, repl in REDACTIONS:
+        text = pattern.sub(repl, text)
+    return text.strip()[:MAX_ERROR_CHARS]
+
+
+def public_error(name: str, e: Exception) -> ToolError | None:
+    """Pesan error yang aman dikirim ke agent. None = pesan asli sudah aman (error validasi kita sendiri).
+
+    Detail lengkap hanya ke log server, dengan error_id supaya bisa dilacak.
+    """
+    cause = e.__cause__ or e
+    if isinstance(cause, ToolError) or (isinstance(cause, (ValueError, RuntimeError)) and not isinstance(cause, DatabricksError)):
+        return None
+    error_id = os.urandom(4).hex()
+    log.error("tool_error %s id=%s: %r", name, error_id, cause, exc_info=cause)
+    if isinstance(cause, Unauthenticated):
+        detail = "autentikasi Databricks gagal (token tidak valid atau kedaluwarsa), hubungi admin server"
+    elif isinstance(cause, DatabricksError):
+        detail = redact(str(cause)) or type(cause).__name__
+    else:
+        detail = "kesalahan internal server"
+    return ToolError(f"Error executing tool {name}: {detail} (error_id: {error_id})")
 
 
 class AuditedFastMCP(FastMCP):
@@ -50,8 +88,11 @@ class AuditedFastMCP(FastMCP):
             size = len(str(result))
             return result
         except Exception as e:
-            outcome = type(e).__name__
-            raise
+            outcome = type(e.__cause__ or e).__name__
+            safe = public_error(name, e)
+            if safe is None:
+                raise
+            raise safe from None
         finally:
             audit.info(json.dumps({"event": "tool_call", "tool": name, "arg_keys": sorted(arguments or {}),
                                    "outcome": outcome, "result_chars": size,

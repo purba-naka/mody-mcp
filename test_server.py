@@ -667,3 +667,66 @@ def test_audit_records_result_size(fake, caplog):
     caplog.set_level("INFO", logger="mody_mcp.audit")
     asyncio.run(server.mcp.call_tool("list_catalogs", {}))
     assert json.loads(caplog.records[-1].getMessage())["result_chars"] > 0
+
+
+# ---------- error tidak membocorkan infrastruktur ----------
+
+LEAK = ("Invalid access token. [ReqId: bf27bfc7-022b-43fb-b5be-f77bff4f44e4]. Config: host=https://dbc-8b1039d3-2f89.cloud.databricks.com, "
+        "account_id=6191a06d-f4a8-4af5-b104-f5e62c99654b, workspace_id=3548926076417386, auth_type=pat. Env: DATABRICKS_HOST")
+SECRETS = ("dbc-8b1039d3", "6191a06d", "3548926076417386", "bf27bfc7", "cloud.databricks.com", "DATABRICKS_HOST")
+
+
+def call_error(name, args):
+    import asyncio
+    with pytest.raises(Exception) as exc:  # noqa: B017
+        asyncio.run(server.mcp.call_tool(name, args))
+    return str(exc.value)
+
+
+def test_unauthenticated_error_is_sanitized(fake):
+    from databricks.sdk.errors import Unauthenticated
+
+    def boom():
+        raise Unauthenticated(LEAK)
+
+    fake.catalogs = NS(list=boom)
+    msg = call_error("list_catalogs", {})
+    assert not any(s in msg for s in SECRETS)
+    assert "autentikasi Databricks gagal" in msg and "error_id:" in msg
+
+
+def test_other_databricks_error_is_redacted(fake):
+    from databricks.sdk.errors import NotFound
+
+    def boom(**kw):
+        raise NotFound("Table 'x' not found. [ReqId: abc]. Config: host=https://dbc-1.cloud.databricks.com, workspace_id=1")
+
+    fake.tables = NS(get=boom)
+    msg = call_error("describe_table", {"full_name": TBL})
+    assert "not found" in msg and not any(s in msg for s in ("dbc-1", "Config", "ReqId", "workspace_id"))
+
+
+def test_unknown_exception_is_generic(fake):
+    def boom():
+        raise KeyError("http://internal.corp/secret")
+
+    fake.catalogs = NS(list=boom)
+    msg = call_error("list_catalogs", {})
+    assert "internal.corp" not in msg and "kesalahan internal server" in msg
+
+
+def test_our_own_errors_keep_message(fake):
+    assert "tidak diizinkan" in call_error("list_schemas", {"catalog": "main"})
+
+
+def test_audit_outcome_records_real_cause(fake, caplog):
+    from databricks.sdk.errors import Unauthenticated
+    caplog.set_level("INFO", logger="mody_mcp.audit")
+
+    def boom():
+        raise Unauthenticated(LEAK)
+
+    fake.catalogs = NS(list=boom)
+    call_error("list_catalogs", {})
+    rec = json.loads([r for r in caplog.records if r.name == "mody_mcp.audit"][-1].getMessage())
+    assert rec["outcome"] == "Unauthenticated"
