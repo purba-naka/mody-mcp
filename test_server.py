@@ -146,6 +146,7 @@ def test_bearer_auth():
             "search_runs", "get_run", "list_model_versions", "list_job_runs", "get_job_run", "get_task_output",
             "github_list_files", "github_read_file", "github_create_branch", "github_commit_files", "github_create_pr", "github_update_pr",
             "github_pr_status", "github_ci_log",
+                "aggregate_table", "list_models", "list_experiments", "list_jobs",
         }
 
 
@@ -553,3 +554,96 @@ def test_ci_log_rejects_non_agent_job(github, branch):
 def test_github_error_reported(github):
     with pytest.raises(server.GitHubError, match="404 Not Found"):
         server.github_read_file("src/missing.py")
+
+
+# ---------- optimasi tool calling ----------
+
+
+def test_filter_op_schema_has_enum():
+    op = Filter.model_json_schema()["properties"]["op"]
+    assert set(op["enum"]) == server.OPS
+
+
+def test_aggregate_uses_only_parameter_markers():
+    sql, params = server.build_aggregate(
+        TBL, COLS,
+        metrics=[server.Metric(fn="count"), server.Metric(fn="count_distinct", column="period")],
+        group_by=["truth_class", "pred_class"],
+        filters=[Filter(column="scope", op="=", value="x'; DROP TABLE t; --")],
+    )
+    assert sql == (
+        "SELECT IDENTIFIER(:g0), IDENTIFIER(:g1), COUNT(*) AS `n`, COUNT(DISTINCT IDENTIFIER(:m1)) AS `count_distinct_period`"
+        " FROM IDENTIFIER(:tbl) WHERE IDENTIFIER(:f0) = :v0 GROUP BY 1, 2 ORDER BY `n` DESC LIMIT 50"
+    )
+    assert "DROP" not in sql and params["v0"] == "x'; DROP TABLE t; --"
+    assert params["g0"] == "`truth_class`" and params["m1"] == "`period`"
+
+
+@pytest.mark.parametrize("kwargs, msg", [
+    ({"metrics": []}, "1 sampai"),
+    ({"metrics": [server.Metric(fn="avg")]}, "butuh column"),
+    ({"metrics": [server.Metric(fn="avg", column="nope")]}, "tidak ada"),
+    ({"metrics": [server.Metric(fn="count")], "group_by": ["nope"]}, "tidak ada"),
+    ({"metrics": [server.Metric(fn="count")] * 2}, "dobel"),
+    ({"metrics": [server.Metric(fn="count")], "group_by": ["scope"], "order_by": "x; DROP"}, "harus salah satu"),
+    ({"metrics": [server.Metric(fn="count")], "filters": [Filter(column="scope", op="LIKE", value="a")]}, "tidak didukung"),
+])
+def test_aggregate_rejects_bad_input(kwargs, msg):
+    with pytest.raises(ValueError, match=msg):
+        server.build_aggregate(TBL, COLS, **kwargs)
+
+
+def test_aggregate_invalid_fn_rejected_by_schema():
+    with pytest.raises(Exception):  # noqa: B017
+        server.Metric(fn="median", column="scope")
+
+
+def test_aggregate_table_runs(fake):
+    out = server.aggregate_table(TBL, metrics=[server.Metric(fn="count")], group_by=["scope"])
+    assert "GROUP BY 1" in fake.sent["statement"]
+    assert out.startswith("2 baris")
+
+
+def test_zero_rows_hint(fake):
+    fake.statement_execution.execute_statement = lambda **kw: NS(
+        status=NS(state=server.StatementState.SUCCEEDED, error=None),
+        manifest=NS(schema=NS(columns=[NS(name="scope")])), result=NS(data_array=[]))
+    assert "preview_table" in server.preview_table(TBL).splitlines()[0]
+
+
+def test_truncation_flagged(fake, monkeypatch):
+    monkeypatch.setenv("MAX_ROWS", "2")
+    first = server.preview_table(TBL).splitlines()[0]
+    assert "MAX_ROWS=2" in first and "aggregate_table" in first
+
+
+def test_no_truncation_note_below_limit(fake):
+    assert server.preview_table(TBL).splitlines()[0] == "2 baris"
+
+
+def test_list_models(fake):
+    fake.registered_models = NS(list=lambda catalog_name, schema_name: [NS(full_name="mody_dev.core.m", comment=None)])
+    assert "mody_dev.core.m" in server.list_models("mody_dev", "core")
+    with pytest.raises(ValueError, match="tidak diizinkan"):
+        server.list_models("main", "core")
+
+
+def test_list_experiments_only_allowed_prefix(mlflow_fake):
+    mlflow_fake.experiments.list_experiments = lambda max_results=None: [
+        NS(name="/Shared/mody/a", last_update_time=0), NS(name="/Shared/other/b", last_update_time=0)]
+    out = server.list_experiments()
+    assert "/Shared/mody/a" in out and "other" not in out
+
+
+def test_list_jobs_only_allowed_prefix(jobs_fake):
+    jobs_fake.jobs.list = lambda limit=None: [
+        NS(job_id=1, settings=NS(name="mody_train_dev")), NS(job_id=2, settings=NS(name="rahasia"))]
+    out = server.list_jobs()
+    assert "mody_train_dev" in out and "rahasia" not in out
+
+
+def test_audit_records_result_size(fake, caplog):
+    import asyncio
+    caplog.set_level("INFO", logger="mody_mcp.audit")
+    asyncio.run(server.mcp.call_tool("list_catalogs", {}))
+    assert json.loads(caplog.records[-1].getMessage())["result_chars"] > 0

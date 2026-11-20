@@ -18,7 +18,7 @@ import time
 from datetime import datetime, timezone
 from functools import cache
 from itertools import islice
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from databricks.sdk import WorkspaceClient
@@ -28,7 +28,7 @@ from databricks.sdk.service.sql import (
     StatementState,
 )
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 HOST = os.environ.get("HOST", "127.0.0.1")  # remote: set HOST eksplisit, taruh di belakang proxy TLS
 PORT = int(os.environ.get("PORT", "8000"))
@@ -44,15 +44,18 @@ class AuditedFastMCP(FastMCP):
     """Satu baris JSON per tool call untuk SIEM. Hanya nama argumen, bukan nilainya (bisa berisi PII/kode)."""
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        start, outcome = time.monotonic(), "ok"
+        start, outcome, size = time.monotonic(), "ok", None
         try:
-            return await super().call_tool(name, arguments)
+            result = await super().call_tool(name, arguments)
+            size = len(str(result))
+            return result
         except Exception as e:
             outcome = type(e).__name__
             raise
         finally:
             audit.info(json.dumps({"event": "tool_call", "tool": name, "arg_keys": sorted(arguments or {}),
-                                   "outcome": outcome, "ms": round((time.monotonic() - start) * 1000)}))
+                                   "outcome": outcome, "result_chars": size,
+                                   "ms": round((time.monotonic() - start) * 1000)}))
 
 
 mcp = AuditedFastMCP("mody-mcp", host=HOST, port=PORT, stateless_http=True, json_response=True)
@@ -127,7 +130,10 @@ def list_schemas(catalog: str) -> str:
 
 @mcp.tool()
 def list_tables(catalog: str, schema: str, include_columns: bool = False) -> str:
-    """Daftar tabel di satu schema. include_columns=True menambahkan kolom tiap tabel (output lebih panjang)."""
+    """Daftar tabel di satu schema. include_columns=True menambahkan kolom tiap tabel (output panjang).
+
+    Biarkan include_columns=False kecuali perlu kolom banyak tabel sekaligus. Untuk satu tabel pakai describe_table.
+    """
     check_catalog(catalog)
     tables = list(ws().tables.list(catalog_name=catalog, schema_name=schema, omit_columns=not include_columns))
     out = f"Tabel di {catalog}.{schema} ({len(tables)}):\n" + md_table(
@@ -137,6 +143,14 @@ def list_tables(catalog: str, schema: str, include_columns: bool = False) -> str
     if include_columns:
         out += "".join(f"\n\n### {t.name}\n{columns_table(t.columns)}" for t in tables)
     return out
+
+
+@mcp.tool()
+def list_models(catalog: str, schema: str) -> str:
+    """Daftar model terdaftar (Unity Catalog) di satu schema. Pakai ini untuk mencari full_name model sebelum list_model_versions."""
+    check_catalog(catalog)
+    rows = [[m.full_name, m.comment] for m in ws().registered_models.list(catalog_name=catalog, schema_name=schema)]
+    return f"Model di {catalog}.{schema} ({len(rows)}):\n" + md_table(["full_name", "comment"], rows)
 
 
 @mcp.tool()
@@ -157,9 +171,37 @@ def describe_table(full_name: str) -> str:
 
 
 class Filter(BaseModel):
-    column: str
-    op: str
+    column: str = Field(description="Nama kolom, harus ada di tabel (cek describe_table)")
+    op: str = Field(
+        description="Operator, tepat salah satu dari daftar enum",
+        json_schema_extra={"enum": sorted(OPS)},
+    )
     value: str | int | float | bool | list[str | int | float | bool] | None = None
+
+
+def where_clause(filters: list[Filter] | None, ident: Any, params: dict[str, str]) -> str:
+    """Susun ' WHERE ...' dari filter. Nama dan nilai selalu jadi parameter marker. Kosong kalau tanpa filter."""
+    where = []
+    for i, f in enumerate(filters or []):
+        op = f.op.upper().strip()
+        if op not in OPS:
+            raise ValueError(f"op '{f.op}' tidak didukung. Pilihan: {sorted(OPS)}")
+        col = ident(f.column, f"f{i}")
+        if op in ("IS NULL", "IS NOT NULL"):
+            where.append(f"{col} {op}")
+        elif op == "IN":
+            values = f.value if isinstance(f.value, list) else [f.value]
+            if not values or len(values) > MAX_IN_VALUES:
+                raise ValueError(f"op IN butuh list berisi 1 sampai {MAX_IN_VALUES} value")
+            keys = [f"v{i}_{j}" for j in range(len(values))]
+            params.update({k: str(v) for k, v in zip(keys, values)})
+            where.append(f"{col} IN ({', '.join(':' + k for k in keys)})")
+        else:
+            if f.value is None or isinstance(f.value, list):
+                raise ValueError(f"op {op} butuh satu value")
+            params[f"v{i}"] = str(f.value)
+            where.append(f"{col} {op} :v{i}")
+    return " WHERE " + " AND ".join(where) if where else ""
 
 
 def build_query(
@@ -183,28 +225,7 @@ def build_query(
     select = ", ".join(ident(c, f"c{i}") for i, c in enumerate(columns)) if columns else "*"
     sql = f"SELECT {select} FROM IDENTIFIER(:tbl)"
 
-    where = []
-    for i, f in enumerate(filters or []):
-        op = f.op.upper().strip()
-        if op not in OPS:
-            raise ValueError(f"op '{f.op}' tidak didukung. Pilihan: {sorted(OPS)}")
-        col = ident(f.column, f"f{i}")
-        if op in ("IS NULL", "IS NOT NULL"):
-            where.append(f"{col} {op}")
-        elif op == "IN":
-            values = f.value if isinstance(f.value, list) else [f.value]
-            if not values or len(values) > MAX_IN_VALUES:
-                raise ValueError(f"op IN butuh list berisi 1 sampai {MAX_IN_VALUES} value")
-            keys = [f"v{i}_{j}" for j in range(len(values))]
-            params.update({k: str(v) for k, v in zip(keys, values)})
-            where.append(f"{col} IN ({', '.join(':' + k for k in keys)})")
-        else:
-            if f.value is None or isinstance(f.value, list):
-                raise ValueError(f"op {op} butuh satu value")
-            params[f"v{i}"] = str(f.value)
-            where.append(f"{col} {op} :v{i}")
-    if where:
-        sql += " WHERE " + " AND ".join(where)
+    sql += where_clause(filters, ident, params)
 
     if order_by:
         sql += f" ORDER BY {ident(order_by, 'o')}" + (" DESC" if desc else "")
@@ -233,7 +254,13 @@ def run_query(sql: str, params: dict[str, str]) -> str:
         raise RuntimeError(f"Query {state.value if state else 'UNKNOWN'}: {error}")
     headers = [c.name for c in resp.manifest.schema.columns]
     rows = (resp.result.data_array if resp.result else None) or []
-    return f"{len(rows)} baris\n" + md_table(headers, rows)
+    note = ""
+    if not rows:
+        note = (" - kosong. Cek nilai filter: kolom kategori biasanya berisi teks (mis. 'padi'), bukan angka. "
+                "Lihat nilai asli dengan preview_table")
+    elif len(rows) >= max_rows() or getattr(resp.manifest, "truncated", False):
+        note = f" - mencapai batas MAX_ROWS={max_rows()}, hasil mungkin terpotong. Pakai aggregate_table atau filter lebih sempit"
+    return f"{len(rows)} baris{note}\n" + md_table(headers, rows)
 
 
 def query(full_name: str, **kwargs: Any) -> str:
@@ -245,7 +272,10 @@ def query(full_name: str, **kwargs: Any) -> str:
 
 @mcp.tool()
 def preview_table(full_name: str, limit: int = 20) -> str:
-    """Contoh baris dari satu tabel. full_name = catalog.schema.table. limit dibatasi MAX_ROWS server."""
+    """Contoh baris mentah satu tabel tanpa filter, untuk melihat bentuk dan nilai asli kolom (mis. label teks).
+
+    full_name = catalog.schema.table. limit dibatasi MAX_ROWS server. Untuk statistik pakai aggregate_table.
+    """
     return query(full_name, limit=limit)
 
 
@@ -265,9 +295,100 @@ def query_table(
       Contoh: [{"column": "scope", "op": "=", "value": "production"},
                {"column": "pred_class", "op": "IN", "value": ["padi", "jagung"]}]
     order_by + desc: urutan. limit dibatasi MAX_ROWS server.
+    Untuk hitungan, rata-rata, distribusi, atau perbandingan antar kelas pakai aggregate_table, jangan sampling baris.
     Pakai describe_table dulu untuk tahu nama kolom yang sah.
     """
     return query(full_name, columns=columns, filters=filters, order_by=order_by, desc=desc, limit=limit)
+
+
+MAX_GROUP_BY = 5
+MAX_METRICS = 10
+AGG_FUNCS = {"count": "COUNT", "count_distinct": "COUNT", "avg": "AVG", "min": "MIN", "max": "MAX", "sum": "SUM"}
+
+
+class Metric(BaseModel):
+    fn: Literal["count", "count_distinct", "avg", "min", "max", "sum"] = Field(
+        description="Fungsi agregat. count tanpa column = jumlah baris"
+    )
+    column: str | None = Field(default=None, description="Kolom yang diagregasi. Kosong hanya untuk count")
+
+
+def build_aggregate(
+    full_name: str,
+    known_columns: set[str],
+    metrics: list[Metric],
+    group_by: list[str] | None = None,
+    filters: list[Filter] | None = None,
+    order_by: str | None = None,
+    desc: bool = True,
+    limit: int = 50,
+) -> tuple[str, dict[str, str]]:
+    """Susun SELECT agregat bertemplate. Sama seperti build_query: nama dan nilai jadi parameter marker."""
+    params: dict[str, str] = {"tbl": full_name}
+    group_by = group_by or []
+    if not metrics or len(metrics) > MAX_METRICS or len(group_by) > MAX_GROUP_BY:
+        raise ValueError(f"metrics wajib 1 sampai {MAX_METRICS}, group_by maksimal {MAX_GROUP_BY}")
+
+    def ident(name: str, key: str) -> str:
+        if name not in known_columns:
+            raise ValueError(f"Kolom '{name}' tidak ada. Kolom yang sah: {sorted(known_columns)}")
+        params[key] = f"`{name}`"
+        return f"IDENTIFIER(:{key})"
+
+    select = [ident(c, f"g{i}") for i, c in enumerate(group_by)]
+    aliases: list[str] = []
+    for i, m in enumerate(metrics):
+        if m.column is None:
+            if m.fn != "count":
+                raise ValueError(f"fn '{m.fn}' butuh column")
+            expr, alias = "COUNT(*)", "n"
+        else:
+            col = ident(m.column, f"m{i}")
+            expr = f"COUNT(DISTINCT {col})" if m.fn == "count_distinct" else f"{AGG_FUNCS[m.fn]}({col})"
+            alias = f"{m.fn}_{re.sub(r'[^A-Za-z0-9_]', '_', m.column)}"
+        if alias in aliases:
+            raise ValueError(f"Metrik '{alias}' dobel")
+        aliases.append(alias)
+        select.append(f"{expr} AS `{alias}`")
+
+    sql = f"SELECT {', '.join(select)} FROM IDENTIFIER(:tbl)" + where_clause(filters, ident, params)
+    if group_by:
+        sql += " GROUP BY " + ", ".join(str(i + 1) for i in range(len(group_by)))
+        target = order_by or aliases[0]
+        if target in aliases:
+            sql += f" ORDER BY `{target}`"
+        elif target in group_by:
+            sql += f" ORDER BY {group_by.index(target) + 1}"
+        else:
+            raise ValueError(f"order_by '{target}' harus salah satu dari {group_by + aliases}")
+        sql += " DESC" if desc else ""
+    sql += f" LIMIT {clamp(limit)}"
+    return sql, params
+
+
+@mcp.tool()
+def aggregate_table(
+    full_name: str,
+    metrics: list[Metric],
+    group_by: list[str] | None = None,
+    filters: list[Filter] | None = None,
+    order_by: str | None = None,
+    desc: bool = True,
+    limit: int = 50,
+) -> str:
+    """Hitung agregat (jumlah, rata-rata, min, max, sum) satu tabel, opsional per kelompok. Read-only.
+
+    Pakai ini, BUKAN query_table, untuk statistik, perbandingan antar kelas, distribusi, atau confusion matrix:
+    satu panggilan menggantikan banyak sampel baris. Pakai query_table kalau butuh baris mentah.
+    metrics: [{"fn": "count"}, {"fn": "avg", "column": "ndvi"}]. Nama hasil: n, avg_ndvi, dst.
+    group_by: kolom pengelompokan, misalnya ["truth_class", "pred_class"] untuk confusion matrix.
+    filters: sama seperti query_table. order_by: nama hasil metrik atau kolom group_by, default metrik pertama.
+    Pakai describe_table dulu untuk tahu nama kolom yang sah.
+    """
+    split_full_name(full_name)
+    table = ws().tables.get(full_name=full_name)
+    known = {c.name for c in table.columns or []}
+    return run_query(*build_aggregate(full_name, known, metrics, group_by, filters, order_by, desc, limit))
 
 
 # ---------- helper ----------
@@ -310,6 +431,19 @@ def check_experiment(name: str) -> None:
 
 
 @mcp.tool()
+def list_experiments(limit: int = 50) -> str:
+    """Daftar experiment MLflow yang boleh diakses (awalan ALLOWED_EXPERIMENT_PREFIX).
+
+    Pakai ini untuk mencari experiment_path sebelum search_runs. Jangan menebak path.
+    """
+    prefix = normalize_experiment(experiment_prefix())
+    found = (e for e in islice(ws().experiments.list_experiments(max_results=1000), 5000)
+             if normalize_experiment(e.name or "").startswith(prefix))
+    rows = [[e.name, ts(e.last_update_time)] for e in islice(found, clamp(limit))]
+    return f"{len(rows)} experiment\n" + md_table(["experiment_path", "last_update"], rows)
+
+
+@mcp.tool()
 def search_runs(
     experiment_path: str,
     filter: str = "",
@@ -317,7 +451,7 @@ def search_runs(
     metrics: list[str] | None = None,
     limit: int = 10,
 ) -> str:
-    """Daftar run MLflow di satu experiment, terbaru dulu.
+    """Daftar run MLflow (eksperimen ML, bukan Job Databricks) di satu experiment, terbaru dulu.
 
     experiment_path: misalnya /Workspace/Shared/mody/geo_commodity_classification.
     filter: sintaks MLflow, misalnya "tags.git_branch = 'agent/x'" atau "metrics.macro_f1 > 0.7".
@@ -352,7 +486,7 @@ def search_runs(
 
 @mcp.tool()
 def get_run(run_id: str) -> str:
-    """Detail satu run MLflow: params, metrics, dan tags (tanpa tag sistem mlflow.*)."""
+    """Detail satu run MLflow (run_id string dari search_runs, bukan run Job): params, metrics, tags."""
     run = ws().experiments.get_run(run_id).run
     experiment = ws().experiments.get_experiment(run.info.experiment_id).experiment
     check_experiment(experiment.name)
@@ -434,6 +568,19 @@ def job_params(run: Any) -> dict[str, str]:
 
 
 @mcp.tool()
+def list_jobs(limit: int = 50) -> str:
+    """Daftar job Databricks yang boleh diakses (awalan ALLOWED_JOB_PREFIX).
+
+    Pakai ini untuk mencari job_name sebelum list_job_runs. Jangan menebak nama job.
+    """
+    prefix = job_prefix()
+    found = (j for j in islice(ws().jobs.list(limit=100), 2000)
+             if j.settings and (j.settings.name or "").startswith(prefix))
+    rows = [[j.settings.name, j.job_id] for j in islice(found, clamp(limit))]
+    return f"{len(rows)} job\n" + md_table(["job_name", "job_id"], rows)
+
+
+@mcp.tool()
 def list_job_runs(job_name: str, limit: int = 10) -> str:
     """Run terakhir satu job, misalnya mody_train_dev. Kolom overrides berisi parameter yang diubah dari default."""
     check_job_name(job_name)
@@ -452,7 +599,7 @@ def list_job_runs(job_name: str, limit: int = 10) -> str:
 
 @mcp.tool()
 def get_job_run(run_id: int) -> str:
-    """Status satu run job dan tiap task-nya. Pakai task_run_id dari sini di get_task_output untuk melihat error.
+    """Status satu run Job Databricks (run_id angka dari list_job_runs, bukan run MLflow) dan tiap task-nya. Pakai task_run_id dari sini di get_task_output untuk melihat error.
 
     Run yang di-repair menampilkan semua attempt. State run mengikuti repair terakhir.
     """
