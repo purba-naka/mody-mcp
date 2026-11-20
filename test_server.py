@@ -628,10 +628,16 @@ def test_list_models(fake):
         server.list_models("main", "core")
 
 
-def test_list_experiments_only_allowed_prefix(mlflow_fake):
-    mlflow_fake.experiments.list_experiments = lambda max_results=None: [
-        NS(name="/Shared/mody/a", last_update_time=0), NS(name="/Shared/other/b", last_update_time=0)]
-    out = server.list_experiments()
+def test_list_experiments_filters_on_server_and_prefix(mlflow_fake):
+    seen = {}
+
+    def search(filter=None, order_by=None, max_results=None):
+        seen.update(filter=filter, max_results=max_results)
+        return [NS(name="/Shared/mody/a", last_update_time=0), NS(name="/Shared/other/b", last_update_time=0)]
+
+    mlflow_fake.experiments.search_experiments = search
+    out = server.list_experiments(limit=5)
+    assert seen["filter"] == "name LIKE '/Shared/mody/%'" and seen["max_results"] == 10
     assert "/Shared/mody/a" in out and "other" not in out
 
 
@@ -639,7 +645,21 @@ def test_list_jobs_only_allowed_prefix(jobs_fake):
     jobs_fake.jobs.list = lambda limit=None: [
         NS(job_id=1, settings=NS(name="mody_train_dev")), NS(job_id=2, settings=NS(name="rahasia"))]
     out = server.list_jobs()
-    assert "mody_train_dev" in out and "rahasia" not in out
+    assert "mody_train_dev" in out and "rahasia" not in out and "tidak lengkap" not in out
+
+
+def test_list_jobs_stops_scanning(jobs_fake, monkeypatch):
+    monkeypatch.setattr(server, "MAX_JOB_SCAN", 3)
+    pulled = []
+
+    def jobs():
+        for i in range(100):
+            pulled.append(i)
+            yield NS(job_id=i, settings=NS(name=f"x{i}"))
+
+    jobs_fake.jobs.list = lambda limit=None: jobs()
+    out = server.list_jobs()
+    assert len(pulled) == 3 and "tidak lengkap" in out and "list_job_runs" in out
 
 
 def test_audit_records_result_size(fake, caplog):

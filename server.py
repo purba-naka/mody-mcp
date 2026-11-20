@@ -437,9 +437,12 @@ def list_experiments(limit: int = 50) -> str:
     Pakai ini untuk mencari experiment_path sebelum search_runs. Jangan menebak path.
     """
     prefix = normalize_experiment(experiment_prefix())
-    found = (e for e in islice(ws().experiments.list_experiments(max_results=1000), 5000)
-             if normalize_experiment(e.name or "").startswith(prefix))
-    rows = [[e.name, ts(e.last_update_time)] for e in islice(found, clamp(limit))]
+    pattern = prefix.replace("'", "''") + "%"  # filter di server Databricks; startswith di bawah tetap jadi pengaman
+    found = ws().experiments.search_experiments(
+        filter=f"name LIKE '{pattern}'", order_by=["last_update_time DESC"], max_results=min(clamp(limit) * 2, 3000)
+    )
+    rows = [[e.name, ts(e.last_update_time)]
+            for e in islice((e for e in found if normalize_experiment(e.name or "").startswith(prefix)), clamp(limit))]
     return f"{len(rows)} experiment\n" + md_table(["experiment_path", "last_update"], rows)
 
 
@@ -529,6 +532,7 @@ def list_model_versions(full_name: str, limit: int = 20) -> str:
 # ---------- jobs ----------
 
 TRACE_TAIL = 3000
+MAX_JOB_SCAN = 500
 MARKUP = re.compile(r"<[^>]+>|\x1b\[[0-9;]*[A-Za-z]")  # tag HTML dan kode warna ANSI dari notebook
 
 
@@ -573,11 +577,17 @@ def list_jobs(limit: int = 50) -> str:
 
     Pakai ini untuk mencari job_name sebelum list_job_runs. Jangan menebak nama job.
     """
-    prefix = job_prefix()
-    found = (j for j in islice(ws().jobs.list(limit=100), 2000)
-             if j.settings and (j.settings.name or "").startswith(prefix))
-    rows = [[j.settings.name, j.job_id] for j in islice(found, clamp(limit))]
-    return f"{len(rows)} job\n" + md_table(["job_name", "job_id"], rows)
+    prefix, scanned, rows = job_prefix(), 0, []
+    for j in ws().jobs.list(limit=100):
+        scanned += 1
+        if j.settings and (j.settings.name or "").startswith(prefix):
+            rows.append([j.settings.name, j.job_id])
+        if len(rows) >= clamp(limit) or scanned >= MAX_JOB_SCAN:
+            break
+    note = ""
+    if len(rows) < clamp(limit) and scanned >= MAX_JOB_SCAN:
+        note = f" - hanya {MAX_JOB_SCAN} job pertama diperiksa, daftar mungkin tidak lengkap. Kalau tahu namanya, langsung pakai list_job_runs"
+    return f"{len(rows)} job{note}\n" + md_table(["job_name", "job_id"], rows)
 
 
 @mcp.tool()
